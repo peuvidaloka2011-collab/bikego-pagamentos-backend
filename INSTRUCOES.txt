@@ -1,0 +1,24 @@
+BIKEGO PAGAMENTOS BACKEND V1
+
+1. No PowerShell:
+   cd C:\bikego_pagamentos_backend
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   pip install -r requirements.txt
+
+2. Crie o arquivo .env:
+   Copy-Item .env.example .env
+
+3. Abra .env e coloque sua chave do Asaas.
+   Comece com ASAAS_ENV=sandbox
+
+4. Rode:
+   uvicorn main:app --reload --host 127.0.0.1 --port 8000
+
+5. Teste:
+   http://127.0.0.1:8000/health
+
+6. Documentação:
+   http://127.0.0.1:8000/docs
+
+O endpoint POST /api/assinaturas/link cria um link de pagamento recorrente por cartão no Asaas.
