@@ -1,0 +1,33 @@
+BIKEGO PAGAMENTOS BACKEND V2
+
+NOVIDADES:
+- validação segura do webhook Asaas via header asaas-access-token;
+- endpoint de conciliação GET /api/assinaturas/status/{referencia};
+- CORS liberado para o Firebase Hosting BIKEGO Pagamentos;
+- mantém geração de link recorrente mensal por cartão.
+
+NO RENDER, ADICIONE:
+ASAAS_ENV=sandbox
+ASAAS_API_KEY=<sua chave>
+ASAAS_WEBHOOK_TOKEN=<token forte diferente da API key>
+
+WEBHOOK ASAAS:
+URL:
+https://bikego-pagamentos-backend.onrender.com/webhooks/asaas
+
+Use o MESMO ASAAS_WEBHOOK_TOKEN no campo Token de autenticação do Webhook.
+
+Eventos recomendados:
+PAYMENT_CONFIRMED
+PAYMENT_RECEIVED
+PAYMENT_OVERDUE
+PAYMENT_CREDIT_CARD_CAPTURE_REFUSED
+PAYMENT_REFUNDED
+PAYMENT_CHARGEBACK_REQUESTED
+
+Depois do upload no GitHub:
+git add .
+git commit -m "BIKEGO backend webhook v2"
+git push
+
+O Render fará o novo deploy automaticamente.
