@@ -507,6 +507,40 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
     }
 
 
+@app.get("/api/mercadopago/diagnostico")
+async def diagnostico_mercadopago():
+    if not MERCADOPAGO_ACCESS_TOKEN:
+        return {
+            "ok": False,
+            "configurado": False,
+            "mensagem": "MERCADOPAGO_ACCESS_TOKEN não configurado.",
+        }
+
+    prefixo = MERCADOPAGO_ACCESS_TOKEN[:8]
+    try:
+        resposta = await mercadopago_get(
+            "/preapproval/search",
+            params={"limit": 1},
+        )
+        return {
+            "ok": True,
+            "configurado": True,
+            "token_prefixo": f"{prefixo}...",
+            "assinaturas_api": "AUTORIZADA",
+            "resultados": len(resposta.get("results") or []),
+        }
+    except HTTPException as exc:
+        detalhe = exc.detail
+        return {
+            "ok": False,
+            "configurado": True,
+            "token_prefixo": f"{prefixo}...",
+            "assinaturas_api": "NAO_AUTORIZADA",
+            "status_code": exc.status_code,
+            "detail": detalhe,
+        }
+
+
 @app.post("/api/assinaturas/mercadopago/link")
 async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
     email = dados.email.strip().lower()
