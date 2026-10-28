@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -16,6 +18,12 @@ load_dotenv()
 ASAAS_API_KEY = os.getenv("ASAAS_API_KEY", "").strip()
 ASAAS_ENV = os.getenv("ASAAS_ENV", "sandbox").strip().lower()
 ASAAS_WEBHOOK_TOKEN = os.getenv("ASAAS_WEBHOOK_TOKEN", "").strip()
+MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "").strip()
+MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
+MERCADOPAGO_BACK_URL = os.getenv(
+    "MERCADOPAGO_BACK_URL",
+    "https://bikego-pagamentos-web.web.app",
+).strip()
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 
@@ -245,7 +253,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.1.0")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -268,6 +276,10 @@ class LinkAssinaturaRequest(BaseModel):
         max_length=500,
     )
     referencia: Optional[str] = Field(default=None, max_length=200)
+
+
+class MercadoPagoLinkRequest(LinkAssinaturaRequest):
+    email: str = Field(min_length=5, max_length=180)
 
 
 def asaas_headers() -> dict:
@@ -310,13 +322,122 @@ async def asaas_get(path: str, params: Optional[dict] = None) -> dict:
     return data
 
 
+MERCADOPAGO_BASE_URL = "https://api.mercadopago.com"
+
+
+def mercadopago_headers() -> dict:
+    if not MERCADOPAGO_ACCESS_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="MERCADOPAGO_ACCESS_TOKEN não configurado no servidor.",
+        )
+    return {
+        "Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}",
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+
+
+async def mercadopago_get(path: str, params: Optional[dict] = None) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                f"{MERCADOPAGO_BASE_URL}{path}",
+                headers=mercadopago_headers(),
+                params=params or {},
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha de comunicação com o Mercado Pago: {exc}",
+        ) from exc
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=data)
+
+    return data
+
+
+async def mercadopago_post(path: str, payload: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{MERCADOPAGO_BASE_URL}{path}",
+                headers=mercadopago_headers(),
+                json=payload,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha de comunicação com o Mercado Pago: {exc}",
+        ) from exc
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=data)
+
+    return data
+
+
+def _data_br_iso(valor: Optional[str]) -> str:
+    texto = (valor or "").strip()
+    if len(texto) >= 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", texto[:10]):
+        ano, mes, dia = texto[:10].split("-")
+        return f"{dia}/{mes}/{ano}"
+    return _data_br(texto)
+
+
+def _validar_webhook_mercadopago(request: Request, data_id: str) -> None:
+    if not MERCADOPAGO_WEBHOOK_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="MERCADOPAGO_WEBHOOK_SECRET não configurado no servidor.",
+        )
+
+    assinatura = request.headers.get("x-signature", "")
+    request_id = request.headers.get("x-request-id", "")
+    if not assinatura or not request_id:
+        raise HTTPException(status_code=401, detail="Webhook Mercado Pago sem assinatura.")
+
+    partes = {}
+    for parte in assinatura.split(","):
+        if "=" in parte:
+            chave, valor = parte.split("=", 1)
+            partes[chave.strip()] = valor.strip()
+
+    ts = partes.get("ts", "")
+    v1 = partes.get("v1", "")
+    if not ts or not v1:
+        raise HTTPException(status_code=401, detail="Assinatura Mercado Pago inválida.")
+
+    manifest = f"id:{data_id};request-id:{request_id};ts:{ts};"
+    esperado = hmac.new(
+        MERCADOPAGO_WEBHOOK_SECRET.encode(),
+        manifest.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(esperado, v1):
+        raise HTTPException(status_code=401, detail="Webhook Mercado Pago não autorizado.")
+
+
 @app.get("/")
 def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.1.0",
+        "versao": "2.2.0",
         "ambiente_asaas": ASAAS_ENV,
+        "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "firebase_configurado": _firebase_configurado(),
     }
 
@@ -327,6 +448,8 @@ def health():
         "ok": True,
         "asaas_configurado": bool(ASAAS_API_KEY),
         "webhook_token_configurado": bool(ASAAS_WEBHOOK_TOKEN),
+        "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
+        "mercadopago_webhook_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
         "firebase_configurado": _firebase_configurado(),
         "firebase_project_id": FIREBASE_PROJECT_ID or None,
         "ambiente": ASAAS_ENV,
@@ -376,6 +499,132 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
         "tipo": "CREDIT_CARD_RECURRENT",
         "referencia": dados.referencia,
         "asaas": resposta,
+    }
+
+
+@app.post("/api/assinaturas/mercadopago/link")
+async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
+    email = dados.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
+
+    payload = {
+        "reason": "BIKEGO - ARMAZENAMENTO FIREBASE",
+        "external_reference": dados.referencia,
+        "payer_email": email,
+        "auto_recurring": {
+            "frequency": 1,
+            "frequency_type": "months",
+            "transaction_amount": round(dados.valor, 2),
+            "currency_id": "BRL",
+        },
+        "back_url": MERCADOPAGO_BACK_URL,
+        "status": "pending",
+    }
+
+    resposta = await mercadopago_post("/preapproval", payload)
+    link = resposta.get("init_point")
+    if not link:
+        raise HTTPException(
+            status_code=502,
+            detail="Mercado Pago não retornou o link da assinatura.",
+        )
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO",
+        "empresa": dados.empresa,
+        "valor": dados.valor,
+        "referencia": dados.referencia,
+        "subscriptionId": resposta.get("id"),
+        "url": link,
+        "mercadopago": resposta,
+    }
+
+
+@app.get("/api/assinaturas/mercadopago/status/{referencia}")
+async def status_assinatura_mercadopago(
+    referencia: str,
+    email: Optional[str] = None,
+):
+    params = {"limit": 50}
+    if email:
+        params["payer_email"] = email.strip().lower()
+
+    busca = await mercadopago_get("/preapproval/search", params=params)
+    resultados = busca.get("results") or []
+    assinatura = next(
+        (
+            item
+            for item in resultados
+            if str(item.get("external_reference") or "") == referencia
+        ),
+        None,
+    )
+
+    if not assinatura:
+        return {
+            "ok": True,
+            "provedor": "MERCADO_PAGO",
+            "referencia": referencia,
+            "status": "AGUARDANDO_PAGAMENTO",
+            "pago": False,
+        }
+
+    subscription_id = assinatura.get("id")
+    status_mp = str(assinatura.get("status") or "").lower()
+    proxima = _data_br_iso(assinatura.get("next_payment_date"))
+
+    pago = status_mp == "authorized"
+    vencido = status_mp in {"paused", "cancelled"}
+
+    if subscription_id:
+        try:
+            faturas = await mercadopago_get(
+                "/authorized_payments/search",
+                params={"preapproval_id": subscription_id},
+            )
+            items = faturas.get("results") or []
+            if items:
+                items = sorted(
+                    items,
+                    key=lambda x: str(x.get("debit_date") or x.get("date_created") or ""),
+                    reverse=True,
+                )
+                ultima = items[0]
+                pagamento = ultima.get("payment") or {}
+                payment_status = str(pagamento.get("status") or "").lower()
+                if payment_status == "approved":
+                    pago = True
+                    vencido = False
+                elif payment_status in {
+                    "rejected",
+                    "cancelled",
+                    "refunded",
+                    "charged_back",
+                }:
+                    pago = False
+                    vencido = True
+        except HTTPException:
+            pass
+
+    if pago:
+        status = "ATIVO"
+    elif vencido:
+        status = "VENCIDO"
+    else:
+        status = "AGUARDANDO_PAGAMENTO"
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO",
+        "referencia": referencia,
+        "status": status,
+        "pago": pago,
+        "subscriptionId": subscription_id,
+        "subscriptionStatus": status_mp,
+        "proximaCobranca": proxima,
+        "valor": (assinatura.get("auto_recurring") or {}).get("transaction_amount"),
     }
 
 
@@ -435,6 +684,100 @@ async def status_assinatura(referencia: str):
         "subscriptionStatus": assinatura.get("status"),
         "proximaCobranca": _data_br(assinatura.get("nextDueDate")),
         "valor": assinatura.get("value"),
+    }
+
+
+@app.post("/webhooks/mercadopago")
+async def webhook_mercadopago(request: Request):
+    evento = await request.json()
+    data = evento.get("data") or {}
+    data_id = str(
+        request.query_params.get("data.id")
+        or request.query_params.get("data_id")
+        or data.get("id")
+        or ""
+    ).strip()
+
+    if not data_id:
+        return {"received": True, "ignored": True, "reason": "sem data.id"}
+
+    _validar_webhook_mercadopago(request, data_id)
+
+    tipo = str(evento.get("type") or "").lower()
+    referencia = None
+    novo_status = None
+    vencimento = None
+    payment_id = None
+
+    if tipo == "payment":
+        pagamento = await mercadopago_get(f"/v1/payments/{data_id}")
+        referencia = pagamento.get("external_reference")
+        payment_id = str(pagamento.get("id") or data_id)
+        payment_status = str(pagamento.get("status") or "").lower()
+
+        if payment_status == "approved":
+            novo_status = "ATIVO"
+        elif payment_status in {
+            "rejected",
+            "cancelled",
+            "refunded",
+            "charged_back",
+        }:
+            novo_status = "VENCIDO"
+
+    elif tipo == "subscription_preapproval":
+        assinatura = await mercadopago_get(f"/preapproval/{data_id}")
+        referencia = assinatura.get("external_reference")
+        status_mp = str(assinatura.get("status") or "").lower()
+        vencimento = assinatura.get("next_payment_date")
+
+        if status_mp == "authorized":
+            novo_status = "ATIVO"
+        elif status_mp in {"paused", "cancelled"}:
+            novo_status = "VENCIDO"
+
+    elif tipo == "subscription_authorized_payment":
+        fatura = await mercadopago_get(f"/authorized_payments/{data_id}")
+        referencia = fatura.get("external_reference")
+        vencimento = fatura.get("debit_date")
+        pagamento = fatura.get("payment") or {}
+        payment_id = str(pagamento.get("id") or "")
+        payment_status = str(pagamento.get("status") or "").lower()
+
+        if payment_status == "approved":
+            novo_status = "ATIVO"
+        elif payment_status in {
+            "rejected",
+            "cancelled",
+            "refunded",
+            "charged_back",
+        }:
+            novo_status = "VENCIDO"
+    else:
+        return {"received": True, "type": tipo, "ignored": True}
+
+    if not referencia:
+        return {
+            "received": True,
+            "type": tipo,
+            "firebaseUpdated": 0,
+            "warning": "Evento Mercado Pago sem external_reference.",
+        }
+
+    atualizados = _sincronizar_cliente_firebase(
+        str(referencia),
+        novo_status=novo_status,
+        vencimento=vencimento,
+        payment_id=payment_id,
+    )
+
+    return {
+        "received": True,
+        "type": tipo,
+        "externalReference": referencia,
+        "firebaseUpdated": atualizados,
+        "statusAplicado": novo_status,
+        "vencimentoAplicado": _data_br_iso(vencimento),
     }
 
 
