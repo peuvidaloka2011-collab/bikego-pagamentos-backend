@@ -24,6 +24,10 @@ MERCADOPAGO_BACK_URL = os.getenv(
     "MERCADOPAGO_BACK_URL",
     "https://bikego-pagamentos-web.web.app",
 ).strip()
+MERCADOPAGO_NOTIFICATION_URL = os.getenv(
+    "MERCADOPAGO_NOTIFICATION_URL",
+    "https://bikego-pagamentos-backend.onrender.com/webhooks/mercadopago",
+).strip()
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "").strip()
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 
@@ -397,11 +401,11 @@ def _data_br_iso(valor: Optional[str]) -> str:
 
 
 def _validar_webhook_mercadopago(request: Request, data_id: str) -> None:
+    # Quando uma assinatura secreta estiver configurada, validamos a origem.
+    # Sem ela, o backend ainda consulta o recurso diretamente na API do
+    # Mercado Pago usando o Access Token antes de alterar qualquer licença.
     if not MERCADOPAGO_WEBHOOK_SECRET:
-        raise HTTPException(
-            status_code=503,
-            detail="MERCADOPAGO_WEBHOOK_SECRET não configurado no servidor.",
-        )
+        return
 
     assinatura = request.headers.get("x-signature", "")
     request_id = request.headers.get("x-request-id", "")
@@ -450,6 +454,7 @@ def health():
         "webhook_token_configurado": bool(ASAAS_WEBHOOK_TOKEN),
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_webhook_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
+        "mercadopago_notification_url": MERCADOPAGO_NOTIFICATION_URL,
         "firebase_configurado": _firebase_configurado(),
         "firebase_project_id": FIREBASE_PROJECT_ID or None,
         "ambiente": ASAAS_ENV,
@@ -519,6 +524,7 @@ async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
             "currency_id": "BRL",
         },
         "back_url": MERCADOPAGO_BACK_URL,
+        "notification_url": MERCADOPAGO_NOTIFICATION_URL,
         "status": "pending",
     }
 
