@@ -589,9 +589,15 @@ async def diagnostico_mercadopago():
 
 @app.post("/api/assinaturas/mercadopago/teste/link")
 async def criar_link_assinatura_mercadopago_teste(dados: MercadoPagoLinkRequest):
-    # Em sandbox, o payer precisa ser um usuário de teste. A própria
-    # referência oficial de Assinaturas usa test@testuser.com para esse fluxo.
-    email = "test@testuser.com"
+    # O pagador precisa ser uma conta de teste COMPRADOR do mesmo site/país
+    # da conta vendedora. Para Brasil, use uma conta de teste MLB criada no
+    # painel do Mercado Pago Developers.
+    email = dados.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe o e-mail da conta de teste COMPRADOR do Mercado Pago.",
+        )
 
     payload = {
         "reason": "BIKEGO - TESTE ARMAZENAMENTO FIREBASE",
