@@ -164,6 +164,42 @@ def _mensagem_status(status: str) -> str:
     return "Aguardando confirmação do pagamento."
 
 
+def _registrar_notificacao_firebase(
+    db,
+    *,
+    cliente_id: str,
+    cliente_nome: str,
+    tipo: str,
+    titulo: str,
+    mensagem: str,
+    nivel: str,
+    referencia: str,
+    payment_id: Optional[str] = None,
+    valor=None,
+    provedor: Optional[str] = None,
+) -> None:
+    chave_base = f"{cliente_id}|{tipo}|{payment_id or referencia}"
+    doc_id = hashlib.sha256(chave_base.encode()).hexdigest()[:32]
+    db.collection("notificacoes").document(doc_id).set(
+        {
+            "tipo": tipo,
+            "titulo": titulo,
+            "mensagem": mensagem,
+            "nivel": nivel,
+            "clienteId": cliente_id,
+            "clienteNome": cliente_nome,
+            "valor": valor,
+            "provedor": provedor or "",
+            "referencia": referencia,
+            "paymentId": payment_id or "",
+            "lida": False,
+            "criadaEm": firestore.SERVER_TIMESTAMP,
+            "origem": "BACKEND",
+        },
+        merge=True,
+    )
+
+
 def _sincronizar_cliente_firebase(
     referencia: str,
     *,
@@ -186,6 +222,7 @@ def _sincronizar_cliente_firebase(
         status_atual = str(dados.get("status") or "AGUARDANDO PAGAMENTO").upper()
         status = (novo_status or status_atual).upper()
         liberado = status == "ATIVO"
+        provedor = str(dados.get("provedorPagamento") or "ASAAS").upper()
 
         vencimento_final = _data_br(vencimento) if vencimento else str(
             dados.get("vencimento") or ""
@@ -253,12 +290,57 @@ def _sincronizar_cliente_firebase(
             )
 
         batch.commit()
+
+        if status != status_atual:
+            if status == "ATIVO":
+                _registrar_notificacao_firebase(
+                    db,
+                    cliente_id=doc.id,
+                    cliente_nome=empresa,
+                    tipo="PAGAMENTO_APROVADO",
+                    titulo="Pagamento aprovado",
+                    mensagem=f"{empresa} teve o pagamento confirmado. Aplicativo liberado.",
+                    nivel="SUCESSO",
+                    referencia=referencia,
+                    payment_id=payment_id,
+                    valor=valor,
+                    provedor=provedor,
+                )
+            elif status == "VENCIDO":
+                _registrar_notificacao_firebase(
+                    db,
+                    cliente_id=doc.id,
+                    cliente_nome=empresa,
+                    tipo="FATURA_VENCIDA",
+                    titulo="Fatura vencida",
+                    mensagem=f"{empresa} entrou em atraso. Verifique a cobrança recorrente.",
+                    nivel="ATENCAO",
+                    referencia=referencia,
+                    payment_id=payment_id,
+                    valor=valor,
+                    provedor=provedor,
+                )
+            elif status == "BLOQUEADO":
+                _registrar_notificacao_firebase(
+                    db,
+                    cliente_id=doc.id,
+                    cliente_nome=empresa,
+                    tipo="APP_BLOQUEADO",
+                    titulo="Aplicativo bloqueado",
+                    mensagem=f"{empresa} teve o acesso bloqueado.",
+                    nivel="ERRO",
+                    referencia=referencia,
+                    payment_id=payment_id,
+                    valor=valor,
+                    provedor=provedor,
+                )
+
         atualizados += 1
 
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.2.0")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -455,7 +537,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.2.0",
+        "versao": "2.3.0",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "firebase_configurado": _firebase_configurado(),
