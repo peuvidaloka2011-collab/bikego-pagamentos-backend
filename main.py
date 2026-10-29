@@ -338,11 +338,14 @@ def mercadopago_headers(teste: bool = False) -> dict:
             status_code=500,
             detail=f"{nome} não configurado no servidor.",
         )
-    return {
+    headers = {
         "Authorization": f"Bearer {token}",
         "accept": "application/json",
         "content-type": "application/json",
     }
+    if teste:
+        headers["X-scope"] = "stage"
+    return headers
 
 
 async def mercadopago_get(
