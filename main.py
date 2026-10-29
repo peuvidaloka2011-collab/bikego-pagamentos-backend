@@ -19,6 +19,7 @@ ASAAS_API_KEY = os.getenv("ASAAS_API_KEY", "").strip()
 ASAAS_ENV = os.getenv("ASAAS_ENV", "sandbox").strip().lower()
 ASAAS_WEBHOOK_TOKEN = os.getenv("ASAAS_WEBHOOK_TOKEN", "").strip()
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "").strip()
+MERCADOPAGO_TEST_ACCESS_TOKEN = os.getenv("MERCADOPAGO_TEST_ACCESS_TOKEN", "").strip()
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
 MERCADOPAGO_BACK_URL = os.getenv(
     "MERCADOPAGO_BACK_URL",
@@ -329,25 +330,32 @@ async def asaas_get(path: str, params: Optional[dict] = None) -> dict:
 MERCADOPAGO_BASE_URL = "https://api.mercadopago.com"
 
 
-def mercadopago_headers() -> dict:
-    if not MERCADOPAGO_ACCESS_TOKEN:
+def mercadopago_headers(teste: bool = False) -> dict:
+    token = MERCADOPAGO_TEST_ACCESS_TOKEN if teste else MERCADOPAGO_ACCESS_TOKEN
+    nome = "MERCADOPAGO_TEST_ACCESS_TOKEN" if teste else "MERCADOPAGO_ACCESS_TOKEN"
+    if not token:
         raise HTTPException(
             status_code=500,
-            detail="MERCADOPAGO_ACCESS_TOKEN não configurado no servidor.",
+            detail=f"{nome} não configurado no servidor.",
         )
     return {
-        "Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "accept": "application/json",
         "content-type": "application/json",
     }
 
 
-async def mercadopago_get(path: str, params: Optional[dict] = None) -> dict:
+async def mercadopago_get(
+    path: str,
+    params: Optional[dict] = None,
+    *,
+    teste: bool = False,
+) -> dict:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.get(
                 f"{MERCADOPAGO_BASE_URL}{path}",
-                headers=mercadopago_headers(),
+                headers=mercadopago_headers(teste),
                 params=params or {},
             )
     except httpx.RequestError as exc:
@@ -367,12 +375,17 @@ async def mercadopago_get(path: str, params: Optional[dict] = None) -> dict:
     return data
 
 
-async def mercadopago_post(path: str, payload: dict) -> dict:
+async def mercadopago_post(
+    path: str,
+    payload: dict,
+    *,
+    teste: bool = False,
+) -> dict:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{MERCADOPAGO_BASE_URL}{path}",
-                headers=mercadopago_headers(),
+                headers=mercadopago_headers(teste),
                 json=payload,
             )
     except httpx.RequestError as exc:
@@ -453,6 +466,7 @@ def health():
         "asaas_configurado": bool(ASAAS_API_KEY),
         "webhook_token_configurado": bool(ASAAS_WEBHOOK_TOKEN),
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
+        "mercadopago_teste_configurado": bool(MERCADOPAGO_TEST_ACCESS_TOKEN),
         "mercadopago_webhook_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
         "mercadopago_notification_url": MERCADOPAGO_NOTIFICATION_URL,
         "firebase_configurado": _firebase_configurado(),
@@ -507,6 +521,38 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
     }
 
 
+@app.get("/api/mercadopago/teste/diagnostico")
+async def diagnostico_mercadopago_teste():
+    if not MERCADOPAGO_TEST_ACCESS_TOKEN:
+        return {
+            "ok": False,
+            "configurado": False,
+            "mensagem": "MERCADOPAGO_TEST_ACCESS_TOKEN não configurado.",
+        }
+
+    prefixo = MERCADOPAGO_TEST_ACCESS_TOKEN[:8]
+    try:
+        resposta = await mercadopago_get("/preapproval/search", params={"limit": 1}, teste=True)
+        return {
+            "ok": True,
+            "configurado": True,
+            "token_prefixo": f"{prefixo}...",
+            "assinaturas_api": "AUTORIZADA",
+            "ambiente": "TESTE",
+            "resultados": len(resposta.get("results") or []),
+        }
+    except HTTPException as exc:
+        return {
+            "ok": False,
+            "configurado": True,
+            "token_prefixo": f"{prefixo}...",
+            "assinaturas_api": "NAO_AUTORIZADA",
+            "ambiente": "TESTE",
+            "status_code": exc.status_code,
+            "detail": exc.detail,
+        }
+
+
 @app.get("/api/mercadopago/diagnostico")
 async def diagnostico_mercadopago():
     if not MERCADOPAGO_ACCESS_TOKEN:
@@ -539,6 +585,47 @@ async def diagnostico_mercadopago():
             "status_code": exc.status_code,
             "detail": detalhe,
         }
+
+
+@app.post("/api/assinaturas/mercadopago/teste/link")
+async def criar_link_assinatura_mercadopago_teste(dados: MercadoPagoLinkRequest):
+    email = dados.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
+
+    payload = {
+        "reason": "BIKEGO - TESTE ARMAZENAMENTO FIREBASE",
+        "external_reference": dados.referencia,
+        "payer_email": email,
+        "auto_recurring": {
+            "frequency": 1,
+            "frequency_type": "months",
+            "transaction_amount": round(dados.valor, 2),
+            "currency_id": "BRL",
+        },
+        "back_url": MERCADOPAGO_BACK_URL,
+        "notification_url": f"{MERCADOPAGO_NOTIFICATION_URL}?ambiente=teste",
+        "status": "pending",
+    }
+
+    resposta = await mercadopago_post("/preapproval", payload, teste=True)
+    link = resposta.get("init_point")
+    if not link:
+        raise HTTPException(
+            status_code=502,
+            detail="Mercado Pago teste não retornou o link da assinatura.",
+        )
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO_TESTE",
+        "empresa": dados.empresa,
+        "valor": dados.valor,
+        "referencia": dados.referencia,
+        "subscriptionId": resposta.get("id"),
+        "url": link,
+        "mercadopago": resposta,
+    }
 
 
 @app.post("/api/assinaturas/mercadopago/link")
@@ -579,6 +666,53 @@ async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
         "subscriptionId": resposta.get("id"),
         "url": link,
         "mercadopago": resposta,
+    }
+
+
+@app.get("/api/assinaturas/mercadopago/teste/status/{referencia}")
+async def status_assinatura_mercadopago_teste(
+    referencia: str,
+    email: Optional[str] = None,
+):
+    params = {"limit": 50}
+    if email:
+        params["payer_email"] = email.strip().lower()
+
+    busca = await mercadopago_get("/preapproval/search", params=params, teste=True)
+    resultados = busca.get("results") or []
+    assinatura = next(
+        (
+            item
+            for item in resultados
+            if str(item.get("external_reference") or "") == referencia
+        ),
+        None,
+    )
+
+    if not assinatura:
+        return {
+            "ok": True,
+            "provedor": "MERCADO_PAGO_TESTE",
+            "referencia": referencia,
+            "status": "AGUARDANDO_PAGAMENTO",
+            "pago": False,
+        }
+
+    status_mp = str(assinatura.get("status") or "").lower()
+    pago = status_mp == "authorized"
+    vencido = status_mp in {"paused", "cancelled"}
+    status = "ATIVO" if pago else ("VENCIDO" if vencido else "AGUARDANDO_PAGAMENTO")
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO_TESTE",
+        "referencia": referencia,
+        "status": status,
+        "pago": pago,
+        "subscriptionId": assinatura.get("id"),
+        "subscriptionStatus": status_mp,
+        "proximaCobranca": _data_br_iso(assinatura.get("next_payment_date")),
+        "valor": (assinatura.get("auto_recurring") or {}).get("transaction_amount"),
     }
 
 
@@ -744,13 +878,14 @@ async def webhook_mercadopago(request: Request):
     _validar_webhook_mercadopago(request, data_id)
 
     tipo = str(evento.get("type") or "").lower()
+    ambiente_teste = request.query_params.get("ambiente", "").lower() == "teste"
     referencia = None
     novo_status = None
     vencimento = None
     payment_id = None
 
     if tipo == "payment":
-        pagamento = await mercadopago_get(f"/v1/payments/{data_id}")
+        pagamento = await mercadopago_get(f"/v1/payments/{data_id}", teste=ambiente_teste)
         referencia = pagamento.get("external_reference")
         payment_id = str(pagamento.get("id") or data_id)
         payment_status = str(pagamento.get("status") or "").lower()
@@ -766,7 +901,7 @@ async def webhook_mercadopago(request: Request):
             novo_status = "VENCIDO"
 
     elif tipo == "subscription_preapproval":
-        assinatura = await mercadopago_get(f"/preapproval/{data_id}")
+        assinatura = await mercadopago_get(f"/preapproval/{data_id}", teste=ambiente_teste)
         referencia = assinatura.get("external_reference")
         status_mp = str(assinatura.get("status") or "").lower()
         vencimento = assinatura.get("next_payment_date")
@@ -777,7 +912,7 @@ async def webhook_mercadopago(request: Request):
             novo_status = "VENCIDO"
 
     elif tipo == "subscription_authorized_payment":
-        fatura = await mercadopago_get(f"/authorized_payments/{data_id}")
+        fatura = await mercadopago_get(f"/authorized_payments/{data_id}", teste=ambiente_teste)
         referencia = fatura.get("external_reference")
         vencimento = fatura.get("debit_date")
         pagamento = fatura.get("payment") or {}
