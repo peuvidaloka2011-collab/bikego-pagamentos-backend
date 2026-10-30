@@ -2744,10 +2744,33 @@ async def status_assinatura(referencia: str):
     }
 
 
+@app.get("/webhooks/mercadopago/health")
+def health_webhook_mercadopago():
+    """Confirma existencia da rota, sem simular pagamento ou liberar licenca."""
+    return {
+        "ok": True,
+        "webhook": "disponivel",
+        "segredo_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
+        "aviso": "Consulta somente leitura; nao comprova entrega de notificacao.",
+    }
+
+
 @app.post("/webhooks/mercadopago")
 async def webhook_mercadopago(request: Request):
-    evento = await request.json()
+    # Swagger /docs gera POST vazio quando nenhum corpo e informado.
+    # Isto nao e uma notificacao do Mercado Pago e nao deve causar HTTP 500.
+    try:
+        evento = await request.json()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Corpo JSON ausente ou invalido. Use o simulador de Webhooks do Mercado Pago.",
+        ) from exc
+    if not isinstance(evento, dict):
+        raise HTTPException(status_code=400, detail="Evento deve ser um objeto JSON.")
     data = evento.get("data") or {}
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Campo data da notificacao invalido.")
     data_id = str(
         request.query_params.get("data.id")
         or request.query_params.get("data_id")
@@ -2758,7 +2781,23 @@ async def webhook_mercadopago(request: Request):
     if not data_id:
         return {"received": True, "ignored": True, "reason": "sem data.id"}
 
+    # Rejeita notificacoes que nao puderem ser autenticadas; jamais confia
+    # apenas no id ou no live_mode enviado no corpo da requisicao.
+    if not MERCADOPAGO_WEBHOOK_SECRET:
+        raise HTTPException(status_code=503, detail="Assinatura secreta do webhook nao configurada.")
     _validar_webhook_mercadopago(request, data_id)
+
+    # O simulador oficial envia live_mode=false, frequentemente com data.id
+    # ficticio (por exemplo 123456). Nunca consultar /v1/payments/123456:
+    # esse recurso nao existe e gerava HTTP 404. Validamos assinatura ANTES
+    # de descartar a notificacao, e jamais atualizamos faturas reais.
+    if evento.get("live_mode") is False:
+        return {
+            "received": True,
+            "ignored": True,
+            "reason": "Notificacao assinada de teste/simulacao; nenhuma licenca alterada.",
+            "firebaseUpdated": 0,
+        }
 
     tipo = str(evento.get("type") or "").lower()
     ambiente_teste = request.query_params.get("ambiente", "").lower() == "teste"
