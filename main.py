@@ -1357,14 +1357,48 @@ def _v52_id_fatura(cliente_id, periodo):
 
 
 def _v52_admin(authorization):
+    """Autentica o administrador via ID Token do projeto Firebase do backend.
+
+    O Firestore e inicializado de modo lazy; na V53 o token era verificado
+    ANTES de chamar get_firestore_db(), entao a primeira chamada do Render
+    podia levantar ValueError de app nao inicializado e virar HTTP 401.
+    """
     if not BIKEGO_ADMIN_UID:
         raise HTTPException(503, "BIKEGO_ADMIN_UID nao configurado: operacao bloqueada.")
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Autenticacao Firebase necessaria.")
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(401, "Token Firebase nao informado.")
+
+    # Inicializa Firebase Admin com as mesmas credenciais do Firestore
+    # antes de solicitar a validacao criptografica do ID token.
+    get_firestore_db()  # Se indisponivel, conserva o status HTTP 503.
     try:
-        decoded = auth.verify_id_token(authorization.split(" ", 1)[1].strip(), check_revoked=True)
-    except Exception:
-        raise HTTPException(401, "Sessao Firebase invalida ou expirada.")
+        firebase_app = firebase_admin.get_app()
+        decoded = auth.verify_id_token(
+            token, app=firebase_app, check_revoked=True
+        )
+    except auth.ExpiredIdTokenError as exc:
+        raise HTTPException(401, "Sessao Firebase expirada. Saia e entre novamente.") from exc
+    except auth.RevokedIdTokenError as exc:
+        raise HTTPException(401, "Sessao Firebase revogada. Entre novamente.") from exc
+    except (auth.InvalidIdTokenError, ValueError) as exc:
+        raise HTTPException(
+            401,
+            "Token Firebase invalido. Confira se o aplicativo usa o mesmo projeto Firebase do backend.",
+        ) from exc
+    except Exception as exc:
+        # Falhas de servico/permissoes nao devem ser apresentadas como
+        # credenciais invalidas. Nao incluir JWT, e-mail ou segredos nos logs.
+        import logging
+        logging.getLogger("bikego.auth").warning(
+            "Falha de verificacao Firebase Admin: %s", type(exc).__name__
+        )
+        raise HTTPException(
+            503, "Falha temporaria ao verificar a sessao Firebase no servidor."
+        ) from exc
+
     if str(decoded.get("uid") or "") != BIKEGO_ADMIN_UID:
         raise HTTPException(403, "Usuario nao autorizado a emitir faturas.")
     return decoded
@@ -1407,6 +1441,25 @@ def v52_preparacao():
             "firebase_configurado": _firebase_configurado(),
             "fluxo": "Checkout Pro pagamento unico",
             "aviso": "Esta consulta nao cria pagamentos nem libera licencas."}
+
+
+@app.get("/api/v54/firebase/diagnostico")
+def v54_firebase_diagnostico():
+    """Inicializa o Firebase Admin, mas NAO verifica JWT nem cria cobranca.
+
+    Esta consulta apenas confirma a prontidao tecnica do SDK. A identidade
+    administrativa sera verificada na rota protegida de geracao da fatura.
+    """
+    get_firestore_db()
+    app = firebase_admin.get_app()
+    return {
+        "ok": True,
+        "firebase_admin_inicializado": True,
+        "projeto_firebase_configurado": bool(getattr(app, "project_id", None)),
+        "admin_uid_configurado": bool(BIKEGO_ADMIN_UID),
+        "emissao_habilitada": BIKEGO_MP_FATURA_UNICA_ENABLED,
+        "aviso": "Consulta somente leitura. Nenhuma fatura criada ou licenca liberada.",
+    }
 
 
 @app.post("/api/v52/faturas/mercadopago/gerar")
