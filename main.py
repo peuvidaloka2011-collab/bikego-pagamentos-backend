@@ -401,6 +401,19 @@ class MercadoPagoCardSubscriptionRequest(LinkAssinaturaRequest):
     card_token_id: str = Field(min_length=10, max_length=200)
 
 
+class MercadoPagoOneTimePaymentRequest(BaseModel):
+    empresa: str = Field(default="BIKEGO", min_length=2, max_length=120)
+    referencia: str = Field(min_length=2, max_length=200)
+    email: str = Field(min_length=5, max_length=180)
+    card_token_id: str = Field(min_length=10, max_length=200)
+    payment_method_id: str = Field(min_length=2, max_length=50)
+    installments: int = Field(default=1, ge=1, le=12)
+    issuer_id: Optional[str] = Field(default=None, max_length=50)
+    identification_type: Optional[str] = Field(default=None, max_length=20)
+    identification_number: Optional[str] = Field(default=None, max_length=30)
+    request_id: str = Field(min_length=8, max_length=80)
+
+
 class MercadoPagoLinkRequest(LinkAssinaturaRequest):
     email: str = Field(min_length=5, max_length=180)
 
@@ -1146,6 +1159,84 @@ def mercadopago_public_key():
             detail="MERCADOPAGO_PUBLIC_KEY não configurada no servidor.",
         )
     return {"ok": True, "public_key": MERCADOPAGO_PUBLIC_KEY}
+
+
+@app.post("/api/pagamentos/mercadopago/cartao-unico")
+async def criar_pagamento_mercadopago_cartao_unico(
+    dados: MercadoPagoOneTimePaymentRequest,
+):
+    """
+    Diagnóstico de produção: cobra exatamente R$ 5,00 uma única vez.
+    Não cria assinatura e não altera status/licenças no Firebase.
+    """
+    email = dados.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
+
+    payment_method_id = dados.payment_method_id.strip().lower()
+    if not payment_method_id:
+        raise HTTPException(status_code=400, detail="Meio de pagamento não informado.")
+
+    payer = {"email": email}
+    ident_type = (dados.identification_type or "").strip().upper()
+    ident_number = re.sub(r"\D", "", dados.identification_number or "")
+    if ident_type and ident_number:
+        payer["identification"] = {
+            "type": ident_type,
+            "number": ident_number,
+        }
+
+    payload = {
+        "transaction_amount": 5.00,
+        "token": dados.card_token_id,
+        "description": "BIKEGO - TESTE PAGAMENTO UNICO R$ 5,00",
+        "installments": 1,
+        "payment_method_id": payment_method_id,
+        "payer": payer,
+        "external_reference": dados.referencia,
+        "statement_descriptor": "BIKEGO",
+    }
+
+    issuer = (dados.issuer_id or "").strip()
+    if issuer:
+        payload["issuer_id"] = issuer
+
+    headers = mercadopago_headers(False)
+    headers["X-Idempotency-Key"] = dados.request_id.strip()
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{MERCADOPAGO_BASE_URL}/v1/payments",
+                headers=headers,
+                json=payload,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha de comunicação com o Mercado Pago: {exc}",
+        ) from exc
+
+    try:
+        resposta = response.json()
+    except Exception:
+        resposta = {"raw": response.text}
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=resposta)
+
+    status = str(resposta.get("status") or "").lower()
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO",
+        "tipo": "PAGAMENTO_UNICO_DIAGNOSTICO",
+        "valor": 5.00,
+        "referencia": dados.referencia,
+        "paymentId": resposta.get("id"),
+        "status": status,
+        "statusDetail": resposta.get("status_detail"),
+        "approved": status == "approved",
+    }
 
 
 @app.post("/api/assinaturas/mercadopago/teste/cartao")
