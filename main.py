@@ -2286,6 +2286,23 @@ async def webhook_mercadopago(request: Request):
             "warning": "Evento Mercado Pago sem external_reference.",
         }
 
+    # Protecao V48: eventos Mercado Pago somente afetam clientes vinculados
+    # a esse provedor; pagamentos de outro provedor nao liberam licencas.
+    db_verificacao = get_firestore_db()
+    clientes_referencia = list(
+        db_verificacao.collection("clientes")
+        .where("referenciaAssinatura", "==", str(referencia))
+        .stream()
+    )
+    if not clientes_referencia:
+        return {"received": True, "ignored": True, "reason": "referencia desconhecida"}
+    if any(
+        not str((d.to_dict() or {}).get("provedorPagamento") or "")
+        .upper().startswith("MERCADO_PAGO")
+        for d in clientes_referencia
+    ):
+        return {"received": True, "ignored": True, "reason": "provedor divergente"}
+
     atualizados = _sincronizar_cliente_firebase(
         str(referencia),
         novo_status=novo_status,
