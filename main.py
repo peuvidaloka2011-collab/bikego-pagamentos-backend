@@ -1,16 +1,17 @@
+import calendar
 import hashlib
 import hmac
 import json
 import os
 import re
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import firebase_admin
 import httpx
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials, firestore, auth
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +35,13 @@ MERCADOPAGO_TEST_BUYER_EMAIL = os.getenv("MERCADOPAGO_TEST_BUYER_EMAIL", "").str
 # Liberacao EXCLUSIVA para gerar preferencias avulsas na conta Seller Test User.
 # Nao altera as rotas de assinaturas ou a producao.
 MERCADOPAGO_AVULSO_TEST_ENABLED = os.getenv("MERCADOPAGO_AVULSO_TEST_ENABLED", "false").strip().lower() == "true"
+# V52: fluxo de fatura unica de PRODUCAO - desligado ate homologacao.
+BIKEGO_MP_FATURA_UNICA_ENABLED = os.getenv("BIKEGO_MP_FATURA_UNICA_ENABLED", "false").strip().lower() == "true"
+BIKEGO_MP_LEGACY_CREATE_ENABLED = os.getenv("BIKEGO_MP_LEGACY_CREATE_ENABLED", "false").strip().lower() == "true"
+BIKEGO_ADMIN_UID = os.getenv("BIKEGO_ADMIN_UID", "").strip()
+MERCADOPAGO_PRODUCTION_SELLER_ID = os.getenv("MERCADOPAGO_PRODUCTION_SELLER_ID", "").strip()
+BIKEGO_FATURAS_CRON_KEY = os.getenv("BIKEGO_FATURAS_CRON_KEY", "").strip()
+
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
 PAGBANK_TOKEN = os.getenv("PAGBANK_TOKEN", "").strip()
 PAGBANK_ENV = os.getenv("PAGBANK_ENV", "production").strip().lower()
@@ -1319,6 +1327,341 @@ async def criar_link_assinatura_mercadopago_teste(
 
 
 # ----------------------------------------------------------------------
+# BIKEGO V52 — FATURA MENSAL AVULSA PRODUTIVA / CHECKOUT PRO
+# PROTEGIDO: requer usuario Firebase com UID explicitamente autorizado.
+# NENHUM acesso a licenca ocorre por retorno de navegador.
+# ----------------------------------------------------------------------
+
+def _v52_agora():
+    return datetime.now(ZoneInfo("America/Sao_Paulo"))
+
+
+def _v52_data(texto):
+    valor = str(texto or "").strip()
+    try:
+        return datetime.strptime(valor[:10], "%d/%m/%Y").date()
+    except ValueError:
+        return None
+
+
+def _v52_proximo_mes(data_base):
+    ano = data_base.year + (1 if data_base.month == 12 else 0)
+    mes = 1 if data_base.month == 12 else data_base.month + 1
+    dia = min(data_base.day, calendar.monthrange(ano, mes)[1])
+    return date(ano, mes, dia)
+
+
+def _v52_id_fatura(cliente_id, periodo):
+    chave = hashlib.sha256(cliente_id.encode("utf-8")).hexdigest()[:20].upper()
+    return f"BIKEGO-FAT-{chave}-{periodo}"
+
+
+def _v52_admin(authorization):
+    if not BIKEGO_ADMIN_UID:
+        raise HTTPException(503, "BIKEGO_ADMIN_UID nao configurado: operacao bloqueada.")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Autenticacao Firebase necessaria.")
+    try:
+        decoded = auth.verify_id_token(authorization.split(" ", 1)[1].strip(), check_revoked=True)
+    except Exception:
+        raise HTTPException(401, "Sessao Firebase invalida ou expirada.")
+    if str(decoded.get("uid") or "") != BIKEGO_ADMIN_UID:
+        raise HTTPException(403, "Usuario nao autorizado a emitir faturas.")
+    return decoded
+
+
+def _v52_operacional():
+    if (not MERCADOPAGO_ACCESS_TOKEN
+            or not MERCADOPAGO_PRODUCTION_SELLER_ID.isdigit()
+            or not _firebase_configurado()):
+        raise HTTPException(503, "Configuracao de producao incompleta: token, Seller ID ou Firebase.")
+
+
+def _v52_habilitado():
+    _v52_operacional()
+    if not BIKEGO_MP_FATURA_UNICA_ENABLED:
+        raise HTTPException(403, "Emissao de fatura avulsa desabilitada no Render.")
+
+
+def _v52_pagar_seguro(dados, fatura):
+    referencia = str(dados.get("external_reference") or "")
+    cents = round(float(dados.get("transaction_amount") or 0) * 100)
+    expected = int(fatura.get("valorCentavos") or 0)
+    collector_id = str(dados.get("collector_id") or (dados.get("collector") or {}).get("id") or "")
+    return (referencia == fatura.get("referencia") and cents == expected
+            and collector_id == MERCADOPAGO_PRODUCTION_SELLER_ID
+            and str(dados.get("currency_id") or "BRL").upper() == "BRL")
+
+
+class V52NovaFaturaRequest(BaseModel):
+    cliente_id: str = Field(min_length=4, max_length=200)
+
+
+@app.get("/api/v52/faturas/preparacao")
+def v52_preparacao():
+    # Diagnostico sem segredos; para homologacao inicial.
+    return {"ok": True, "habilitado": BIKEGO_MP_FATURA_UNICA_ENABLED,
+            "admin_uid_configurado": bool(BIKEGO_ADMIN_UID),
+            "seller_producao_configurado": bool(MERCADOPAGO_PRODUCTION_SELLER_ID),
+            "webhook_secret_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
+            "firebase_configurado": _firebase_configurado(),
+            "fluxo": "Checkout Pro pagamento unico",
+            "aviso": "Esta consulta nao cria pagamentos nem libera licencas."}
+
+
+@app.post("/api/v52/faturas/mercadopago/gerar")
+async def v52_gerar_fatura(dados: V52NovaFaturaRequest, authorization: Optional[str] = Header(default=None)):
+    _v52_admin(authorization)
+    _v52_habilitado()
+    if not MERCADOPAGO_WEBHOOK_SECRET:
+        raise HTTPException(503, "Configure MERCADOPAGO_WEBHOOK_SECRET antes de cobrar clientes reais.")
+    db = get_firestore_db()
+    cliente_ref = db.collection("clientes").document(dados.cliente_id)
+    cliente_snap = cliente_ref.get()
+    if not cliente_snap.exists:
+        raise HTTPException(404, "Cliente nao encontrado no Firebase.")
+    cliente = cliente_snap.to_dict() or {}
+    prov = str(cliente.get("provedorPagamento") or "").upper()
+    if not prov.startswith("MERCADO_PAGO"):
+        raise HTTPException(409, "Cliente nao esta configurado para Mercado Pago.")
+    ref_anterior = str(cliente.get("referenciaAssinatura") or "").strip()
+    if ref_anterior and not ref_anterior.startswith("BIKEGO-FAT-"):
+        raise HTTPException(409, "Cliente possui referencia de cobranca antiga. Verifique/cancele a assinatura anterior e conclua a migracao antes de emitir fatura unica.")
+    if not cliente.get("aplicativosContratados") and not cliente.get("app"):
+        raise HTTPException(400, "Cadastre ao menos um aplicativo no cliente.")
+    try:
+        cents = round(float(cliente.get("valor") or 0) * 100)
+    except (ValueError, TypeError):
+        cents = 0
+    if not (100 <= cents <= 10000000):
+        raise HTTPException(400, "Valor do cliente invalido: R$ 1,00 a R$ 100.000,00.")
+    email = str(cliente.get("emailPagamento") or "").strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(400, "Cadastre um e-mail valido no cliente.")
+    vencimento = _v52_data(cliente.get("vencimento")) or _v52_agora().date()
+    # A fatura corresponde ao mes da data de vencimento cadastrada.
+    periodo = vencimento.strftime("%Y%m")
+    referencia = _v52_id_fatura(dados.cliente_id, periodo)
+    fatura_ref = db.collection("faturas_mp").document(referencia)
+    fatura_snap = fatura_ref.get()
+    if fatura_snap.exists:
+        existente = fatura_snap.to_dict() or {}
+        if existente.get("status") == "PAGO":
+            return {"ok": True, "ja_paga": True, "referencia": referencia,
+                    "status": "PAGO", "url": None,
+                    "mensagem": "Fatura ja paga. Nao efetue novo pagamento."}
+        if existente.get("checkoutUrl"):
+            return {"ok": True, "reutilizada": True,
+                    "referencia": referencia, "status": existente.get("status"),
+                    "url": existente.get("checkoutUrl"), "valor": cents / 100}
+        # Uma primeira chamada pode ter enviado preferencia antes de perder conexao.
+        # Nao criar nova ate reconciliar essa tentativa.
+        raise HTTPException(409, "Fatura ja reservada e sem link. Confira a preferencia no Mercado Pago; nao gere duplicata.")
+
+    # Reserva atomica para impedir duas preferencias do mesmo periodo.
+    # create() falha se outro administrador ja reservou o documento.
+    try:
+        fatura_ref.create({
+            "clienteId": dados.cliente_id, "referencia": referencia,
+            "periodo": periodo, "vencimentoFatura": vencimento.strftime("%d/%m/%Y"),
+            "valorCentavos": cents, "emailPagamento": email,
+            "status": "CRIANDO", "provedor": "MERCADO_PAGO_AVULSO",
+            "criadaEm": firestore.SERVER_TIMESTAMP,
+        })
+    except Exception:
+        raise HTTPException(409, "Fatura ja esta sendo criada. Consulte o cliente antes de repetir.")
+
+    payload = {
+        "items": [{"id": referencia, "title": "BIKEGO - Mensalidade de aplicativos",
+                   "description": f"Fatura {periodo} - Servicos BIKEGO",
+                   "quantity": 1, "currency_id": "BRL", "unit_price": cents / 100}],
+        "payer": {"email": email},
+        "external_reference": referencia,
+        "back_urls": {
+            "success": "https://bikego-pagamentos-web.web.app/",
+            "failure": "https://bikego-pagamentos-web.web.app/",
+            "pending": "https://bikego-pagamentos-web.web.app/",
+        },
+        "notification_url": MERCADOPAGO_NOTIFICATION_URL,
+        "expires": True,
+        "expiration_date_from": _v52_agora().isoformat(timespec="seconds"),
+        "expiration_date_to": (_v52_agora() + timedelta(days=40)).isoformat(timespec="seconds"),
+    }
+    try:
+        pref = await mercadopago_post("/checkout/preferences", payload,
+                                    extra_headers={"X-Idempotency-Key": hashlib.sha256(referencia.encode()).hexdigest()})
+    except HTTPException:
+        fatura_ref.set({"status": "ERRO_CRIACAO", "revisaoManual": True,
+                        "atualizadaEm": firestore.SERVER_TIMESTAMP}, merge=True)
+        raise HTTPException(502, "Nao foi possivel gerar a fatura. Revise no Mercado Pago antes de tentar novamente.")
+    url = str(pref.get("init_point") or "")
+    if not url.startswith("https://"):
+        fatura_ref.set({"status": "SEM_LINK", "revisaoManual": True}, merge=True)
+        raise HTTPException(502, "Mercado Pago nao forneceu link HTTPS. Confira a preferencia.")
+    # Atualizacao de links nao libera nem bloqueia apps existentes.
+    fatura_ref.set({"status": "PENDENTE", "checkoutUrl": url,
+                    "preferenciaId": str(pref.get("id") or ""),
+                    "atualizadaEm": firestore.SERVER_TIMESTAMP}, merge=True)
+    cliente_ref.set({"referenciaAssinatura": referencia,
+                     "linkAssinatura": url, "provedorPagamento": "MERCADO_PAGO_AVULSO",
+                     "metodoPagamento": "CREDITO", "atualizadoEm": firestore.SERVER_TIMESTAMP}, merge=True)
+    return {"ok": True, "referencia": referencia, "url": url,
+            "valor": cents / 100, "status": "PENDENTE", "tipo": "PAGAMENTO_UNICO",
+            "aviso": "Fatura emitida; cliente so sera liberado apos pagamento aprovado."}
+
+
+async def _v52_conciliar_pagamento(payment_id):
+    # Pagamentos existentes continuam conciliaveis mesmo com emissao desligada.
+    _v52_operacional()
+    pagamento = await mercadopago_get(f"/v1/payments/{payment_id}")
+    ref = str(pagamento.get("external_reference") or "")
+    if not re.fullmatch(r"BIKEGO-FAT-[0-9A-F]{20}-\d{6}", ref):
+        raise HTTPException(400, "Pagamento nao pertence a uma fatura V52.")
+    db = get_firestore_db()
+    fatura_ref = db.collection("faturas_mp").document(ref)
+    doc = fatura_ref.get()
+    if not doc.exists:
+        raise HTTPException(404, "Fatura desconhecida; cliente nao foi liberado.")
+    fatura = doc.to_dict() or {}
+    if not _v52_pagar_seguro(pagamento, fatura):
+        raise HTTPException(409, "Referencia, valor ou vendedor divergente; sem liberacao.")
+    novo_status = str(pagamento.get("status") or "").lower()
+    if novo_status == "approved":
+        if fatura.get("status") == "PAGO":
+            return {"ok": True, "status": "PAGO", "ja_processado": True}
+        cliente_id = fatura.get("clienteId")
+        cliente_ref = db.collection("clientes").document(cliente_id)
+        snap = cliente_ref.get()
+        if not snap.exists or str((snap.to_dict() or {}).get("provedorPagamento") or "") != "MERCADO_PAGO_AVULSO":
+            raise HTTPException(409, "Cliente sem vinculo de faturamento V52.")
+        # Nao permitir pagamento antigo alterar uma fatura mais nova do cliente.
+        cliente_atual = snap.to_dict() or {}
+        if str(cliente_atual.get("referenciaAssinatura") or "") != ref:
+            raise HTTPException(409, "Fatura nao e a referencia atual do cliente.")
+        base = _v52_data(fatura.get("vencimentoFatura")) or _v52_agora().date()
+        seguinte = _v52_proximo_mes(base).strftime("%d/%m/%Y")
+        atualizados = _sincronizar_cliente_firebase(ref, novo_status="ATIVO",
+                                                     vencimento=seguinte, payment_id=str(payment_id))
+        if atualizados < 1:
+            raise HTTPException(409, "Pagamento confirmado, mas nao foi encontrada licenca do cliente. Reconciliacao necessaria.")
+        # Se a gravação da licença falhar, a fatura continua conciliável.
+        fatura_ref.set({"status": "PAGO", "paymentId": str(payment_id),
+                        "pagaEm": firestore.SERVER_TIMESTAMP,
+                        "atualizadaEm": firestore.SERVER_TIMESTAMP}, merge=True)
+        return {"ok": True, "status": "PAGO", "clienteLiberado": True,
+                "vencimento": seguinte}
+    if novo_status in {"refunded", "charged_back"}:
+        cli = get_firestore_db().collection("clientes").document(str(fatura.get("clienteId") or "")).get()
+        if not cli.exists or str((cli.to_dict() or {}).get("referenciaAssinatura") or "") != ref:
+            raise HTTPException(409, "Fatura antiga nao pode reverter licenca atual.")
+        if fatura.get("status") == "PAGO":
+            fatura_ref.set({"status": "ESTORNADO", "statusMp": novo_status}, merge=True)
+            _sincronizar_cliente_firebase(ref, novo_status="BLOQUEADO", payment_id=str(payment_id))
+        return {"ok": True, "status": "ESTORNADO"}
+    fatura_ref.set({"statusMp": novo_status,
+                    "atualizadaEm": firestore.SERVER_TIMESTAMP}, merge=True)
+    return {"ok": True, "status": novo_status.upper(), "clienteLiberado": False}
+
+
+class V52ConciliaRequest(BaseModel):
+    payment_id: str = Field(min_length=5, max_length=30)
+
+
+@app.post("/api/v52/faturas/mercadopago/conciliar")
+async def v52_conciliar_admin(dados: V52ConciliaRequest,
+                              authorization: Optional[str] = Header(default=None)):
+    _v52_admin(authorization)
+    if not dados.payment_id.isdigit():
+        raise HTTPException(400, "ID de pagamento invalido.")
+    return await _v52_conciliar_pagamento(dados.payment_id)
+
+
+@app.get("/api/v52/faturas/mercadopago/status/{cliente_id}")
+async def v52_status_cliente(cliente_id: str,
+                              authorization: Optional[str] = Header(default=None)):
+    _v52_admin(authorization)
+    db = get_firestore_db()
+    cliente = db.collection("clientes").document(cliente_id).get()
+    if not cliente.exists:
+        raise HTTPException(404, "Cliente nao encontrado.")
+    data = cliente.to_dict() or {}
+    ref = str(data.get("referenciaAssinatura") or "")
+    inv = db.collection("faturas_mp").document(ref).get() if ref.startswith("BIKEGO-FAT-") else None
+    fatura = (inv.to_dict() or {}) if inv is not None and inv.exists else {}
+    # Consulta sem alterar licencas. Webhook / conciliacao confirmam pagamentos.
+    return {"ok": True, "clienteId": cliente_id,
+            "status": data.get("status", "AGUARDANDO PAGAMENTO"),
+            "vencimento": data.get("vencimento"), "referencia": ref,
+            "faturaStatus": fatura.get("status"), "valor": (fatura.get("valorCentavos") or 0) / 100,
+            "pago": fatura.get("status") == "PAGO"}
+
+
+@app.post("/api/v52/faturas/conciliar-pendentes")
+async def v52_conciliar_pendentes(authorization: Optional[str] = Header(default=None)):
+    _v52_admin(authorization)
+    _v52_operacional()
+    db = get_firestore_db()
+    refs = list(db.collection("faturas_mp").where("status", "==", "PENDENTE").limit(50).stream())
+    saida = {"consultadas": 0, "pagas": 0, "erros": 0}
+    for inv in refs:
+        ref = inv.id
+        try:
+            pagamentos = await mercadopago_get("/v1/payments/search", params={"external_reference": ref, "limit": 30})
+            saida["consultadas"] += 1
+            for p in pagamentos.get("results") or []:
+                if str(p.get("status") or "").lower() != "approved":
+                    continue
+                result = await _v52_conciliar_pagamento(str(p.get("id")))
+                if result.get("status") == "PAGO":
+                    saida["pagas"] += 1
+                    break
+        except Exception:
+            saida["erros"] += 1
+    return saida
+
+
+@app.post("/api/v52/faturas/cron")
+async def v52_cron(x_bikego_cron_key: Optional[str] = Header(default=None)):
+    if (len(BIKEGO_FATURAS_CRON_KEY) < 32 or not x_bikego_cron_key
+            or not hmac.compare_digest(x_bikego_cron_key, BIKEGO_FATURAS_CRON_KEY)):
+        raise HTTPException(401, "Rotina nao autorizada.")
+    _v52_operacional()
+    db = get_firestore_db()
+    hoje = _v52_agora().date()
+    bloqueados = 0
+    conciliadas = 0
+    erros_conciliacao = 0
+    # Recuperacao automatica caso uma notificacao Webhook nao chegue.
+    pendentes = list(db.collection("faturas_mp").where("status", "==", "PENDENTE").limit(100).stream())
+    for fatura_doc in pendentes:
+        try:
+            busca = await mercadopago_get("/v1/payments/search", params={
+                "external_reference": fatura_doc.id, "limit": 30})
+            for item in busca.get("results") or []:
+                if item.get("status") != "approved":
+                    continue
+                r = await _v52_conciliar_pagamento(str(item.get("id")))
+                if r.get("status") == "PAGO":
+                    conciliadas += 1
+                    break
+        except Exception:
+            erros_conciliacao += 1
+    # Limite de seguranca; para volumes maiores, adicionar paginacao.
+    docs = list(db.collection("clientes").where("provedorPagamento", "==", "MERCADO_PAGO_AVULSO").limit(100).stream())
+    for cli in docs:
+        dados = cli.to_dict() or {}
+        venc = _v52_data(dados.get("vencimento"))
+        if (venc and hoje > venc + timedelta(days=2)
+                and str(dados.get("status") or "").upper() == "ATIVO"):
+            ref = str(dados.get("referenciaAssinatura") or "")
+            _sincronizar_cliente_firebase(ref, novo_status="BLOQUEADO")
+            bloqueados += 1
+    return {"ok": True, "clientesVerificados": len(docs), "bloqueados": bloqueados,
+            "faturasConciliadas": conciliadas, "errosConciliacao": erros_conciliacao,
+            "aviso": "Agende esta rota diariamente no Render; sem agendamento nao ha conciliacao e bloqueio periodicos."}
+
+
+# ----------------------------------------------------------------------
 # BIKEGO V51 — COBRANCA UNICA / CHECKOUT PRO (SOMENTE CONTA DE TESTE)
 # Nenhuma rota abaixo altera clientes ou licencas no Firebase.
 # ----------------------------------------------------------------------
@@ -1659,6 +2002,9 @@ def mercadopago_public_key():
 async def criar_pagamento_mercadopago_cartao_unico(
     dados: MercadoPagoOneTimePaymentRequest,
 ):
+    if not BIKEGO_MP_LEGACY_CREATE_ENABLED:
+        raise HTTPException(410, "Rota de cobranca antiga desativada. Utilize o fluxo autenticado V52 de fatura unica.")
+
     """
     Diagnóstico de produção: cobra um valor informado pelo checkout, uma única vez.
     Não cria assinatura e não altera status/licenças no Firebase.
@@ -1862,6 +2208,9 @@ async def criar_assinatura_mercadopago_teste_cartao(
 async def criar_assinatura_mercadopago_cartao(
     dados: MercadoPagoCardSubscriptionRequest,
 ):
+    if not BIKEGO_MP_LEGACY_CREATE_ENABLED:
+        raise HTTPException(410, "Rota de cobranca antiga desativada. Utilize o fluxo autenticado V52 de fatura unica.")
+
     """
     Cria assinatura recorrente diretamente com card_token_id gerado
     pelo Card Payment Brick no navegador do cliente.
@@ -1920,6 +2269,9 @@ async def criar_assinatura_mercadopago_cartao(
 
 @app.post("/api/assinaturas/mercadopago/link")
 async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
+    if not BIKEGO_MP_LEGACY_CREATE_ENABLED:
+        raise HTTPException(410, "Rota de cobranca antiga desativada. Utilize o fluxo autenticado V52 de fatura unica.")
+
     email = dados.email.strip().lower()
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
@@ -2090,6 +2442,9 @@ async def status_pagamento_debito_pagbank(referencia: str):
 
 @app.post("/api/pagamentos/mercadopago/debito/link")
 async def criar_link_pagamento_debito_mercadopago(dados: MercadoPagoLinkRequest):
+    if not BIKEGO_MP_LEGACY_CREATE_ENABLED:
+        raise HTTPException(410, "Rota de cobranca antiga desativada. Utilize o fluxo autenticado V52 de fatura unica.")
+
     """
     Gera uma cobrança mensal avulsa no Checkout Pro, priorizando cartão de débito.
     Diferente do cartão de crédito recorrente, esta cobrança não cria assinatura:
@@ -2481,6 +2836,14 @@ async def webhook_mercadopago(request: Request):
             "reason": "fatura avulsa de teste",
             "firebaseUpdated": 0,
         }
+
+    if str(referencia).startswith("BIKEGO-FAT-"):
+        if not MERCADOPAGO_WEBHOOK_SECRET:
+            raise HTTPException(503, "Webhook assinado obrigatorio para faturas V52.")
+        if tipo != "payment":
+            return {"received": True, "ignored": True, "reason": "evento nao e pagamento"}
+        resultado = await _v52_conciliar_pagamento(str(payment_id))
+        return {"received": True, "faturaV52": True, "resultado": resultado}
 
     # Protecao V48: eventos Mercado Pago somente afetam clientes vinculados
     # a esse provedor; pagamentos de outro provedor nao liberam licencas.
