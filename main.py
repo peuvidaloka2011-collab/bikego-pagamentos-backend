@@ -3,6 +3,7 @@ import hmac
 import json
 import os
 import re
+import uuid
 from typing import Optional
 
 import firebase_admin
@@ -24,6 +25,11 @@ MERCADOPAGO_TEST_ACCESS_TOKEN = os.getenv("MERCADOPAGO_TEST_ACCESS_TOKEN", "").s
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
 PAGBANK_TOKEN = os.getenv("PAGBANK_TOKEN", "").strip()
 PAGBANK_ENV = os.getenv("PAGBANK_ENV", "production").strip().lower()
+APPLEPAY_MERCHANT_ID = os.getenv("APPLEPAY_MERCHANT_ID", "").strip()
+APPLEPAY_MERCHANT_CERTIFICATE_ID = os.getenv("APPLEPAY_MERCHANT_CERTIFICATE_ID", "").strip()
+MERCADOPAGO_APPLEPAY_PRODUCT_ID = os.getenv("MERCADOPAGO_APPLEPAY_PRODUCT_ID", "").strip()
+APPLEPAY_DOMAIN = os.getenv("APPLEPAY_DOMAIN", "bikego-pagamentos-web.web.app").strip()
+APPLEPAY_DISPLAY_NAME = os.getenv("APPLEPAY_DISPLAY_NAME", "FIREBASE ARMAZENAMENTO").strip()
 MERCADOPAGO_BACK_URL = os.getenv(
     "MERCADOPAGO_BACK_URL",
     "https://bikego-pagamentos-web.web.app",
@@ -349,7 +355,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.6.1")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -372,6 +378,21 @@ class LinkAssinaturaRequest(BaseModel):
         max_length=500,
     )
     referencia: Optional[str] = Field(default=None, max_length=200)
+
+
+class ApplePaySessionRequest(BaseModel):
+    validation_url: str = Field(min_length=10, max_length=1000)
+
+
+class ApplePayPaymentRequest(BaseModel):
+    empresa: str = Field(min_length=2, max_length=120)
+    valor: float = Field(gt=0)
+    referencia: str = Field(min_length=2, max_length=200)
+    email: str = Field(min_length=5, max_length=180)
+    cpf: str = Field(min_length=11, max_length=20)
+    payment_data_b64: str = Field(min_length=20)
+    transaction_identifier: str = Field(min_length=4, max_length=300)
+    network: str = Field(min_length=2, max_length=50)
 
 
 class MercadoPagoCardSubscriptionRequest(LinkAssinaturaRequest):
@@ -476,6 +497,84 @@ async def pagbank_get(path: str, params: Optional[dict] = None) -> dict:
         raise HTTPException(
             status_code=502,
             detail=f"Falha de comunicação com o PagBank: {exc}",
+        ) from exc
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=data)
+    return data
+
+
+def _applepay_configurado() -> bool:
+    return bool(
+        MERCADOPAGO_PUBLIC_KEY
+        and MERCADOPAGO_ACCESS_TOKEN
+        and MERCADOPAGO_APPLEPAY_PRODUCT_ID
+        and APPLEPAY_MERCHANT_ID
+        and APPLEPAY_MERCHANT_CERTIFICATE_ID
+        and APPLEPAY_DOMAIN
+    )
+
+
+def applepay_headers() -> dict:
+    if not _applepay_configurado():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Apple Pay ainda não configurado. Verifique Merchant ID, "
+                "certificate_id, Product ID, Public Key e Access Token."
+            ),
+        )
+    return {
+        "X-Product-ID": MERCADOPAGO_APPLEPAY_PRODUCT_ID,
+        "X-Public-key": MERCADOPAGO_PUBLIC_KEY,
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+
+
+async def applepay_post(path: str, payload: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"https://api.mercadopago.com{path}",
+                headers=applepay_headers(),
+                json=payload,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha de comunicação Apple Pay/Mercado Pago: {exc}",
+        ) from exc
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=data)
+    return data
+
+
+async def mercadopago_order_post(payload: dict) -> dict:
+    headers = mercadopago_headers(False)
+    headers["X-Idempotency-Key"] = str(uuid.uuid4())
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.mercadopago.com/v1/orders",
+                headers=headers,
+                json=payload,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha ao criar order Apple Pay: {exc}",
         ) from exc
 
     try:
@@ -616,7 +715,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.6.1",
+        "versao": "2.7.0",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_public_key_configurada": bool(MERCADOPAGO_PUBLIC_KEY),
@@ -635,6 +734,7 @@ def health():
         "mercadopago_webhook_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
         "pagbank_configurado": bool(PAGBANK_TOKEN),
         "pagbank_ambiente": PAGBANK_ENV,
+        "applepay_configurado": _applepay_configurado(),
         "mercadopago_notification_url": MERCADOPAGO_NOTIFICATION_URL,
         "firebase_configurado": _firebase_configurado(),
         "firebase_project_id": FIREBASE_PROJECT_ID or None,
@@ -798,6 +898,140 @@ async def criar_link_assinatura_mercadopago_teste(dados: MercadoPagoLinkRequest)
         "subscriptionId": resposta.get("id"),
         "url": link,
         "mercadopago": resposta,
+    }
+
+
+@app.get("/api/applepay/config")
+def applepay_config():
+    return {
+        "ok": True,
+        "configured": _applepay_configurado(),
+        "merchantIdentifier": APPLEPAY_MERCHANT_ID if _applepay_configurado() else None,
+        "domainName": APPLEPAY_DOMAIN if _applepay_configurado() else None,
+        "displayName": APPLEPAY_DISPLAY_NAME if _applepay_configurado() else None,
+        "countryCode": "BR",
+        "currencyCode": "BRL",
+        "supportedNetworks": ["visa", "masterCard"],
+    }
+
+
+@app.post("/api/applepay/session")
+async def applepay_session(dados: ApplePaySessionRequest):
+    payload = {
+        "id": APPLEPAY_MERCHANT_CERTIFICATE_ID,
+        "merchantIdentifier": APPLEPAY_MERCHANT_ID,
+        "domainName": APPLEPAY_DOMAIN,
+        "displayName": APPLEPAY_DISPLAY_NAME,
+        "initiative": "web",
+        "initiativeContext": APPLEPAY_DOMAIN,
+        "validationURL": dados.validation_url,
+    }
+    return await applepay_post("/applepay/v1/session", payload)
+
+
+@app.post("/api/applepay/pay")
+async def applepay_pay(dados: ApplePayPaymentRequest):
+    cpf = re.sub(r"\D", "", dados.cpf or "")
+    if len(cpf) != 11:
+        raise HTTPException(status_code=400, detail="Informe um CPF válido para o Apple Pay.")
+
+    network_raw = (dados.network or "").strip().lower()
+    network_map = {
+        "visa": "visa",
+        "mastercard": "master",
+        "mastercardcredit": "master",
+        "master card": "master",
+        "master": "master",
+    }
+    payment_method_id = network_map.get(network_raw)
+    if not payment_method_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Apple Pay disponível neste checkout somente para Visa e Mastercard.",
+        )
+
+    tokenize_payload = {
+        "payment_method": {
+            "type": "applepay",
+            "payment_data": dados.payment_data_b64,
+        },
+        "transaction_identifier": dados.transaction_identifier,
+    }
+    tokenizado = await applepay_post(
+        "/platforms/pci/applepay/v1/tokenize",
+        tokenize_payload,
+    )
+    token = str(tokenizado.get("id") or "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=502,
+            detail="Mercado Pago não retornou o token do Apple Pay.",
+        )
+
+    order_payload = {
+        "type": "online",
+        "processing_mode": "automatic",
+        "total_amount": f"{dados.valor:.2f}",
+        "currency_id": "BRL",
+        "external_reference": dados.referencia[:64],
+        "payer": {
+            "email": dados.email.strip().lower(),
+            "identification": {
+                "type": "CPF",
+                "number": cpf,
+            },
+        },
+        "transactions": {
+            "payments": [
+                {
+                    "amount": f"{dados.valor:.2f}",
+                    "payment_method": {
+                        "id": payment_method_id,
+                        "type": "credit_card",
+                        "token": token,
+                        "installments": 1,
+                    },
+                }
+            ]
+        },
+    }
+
+    order = await mercadopago_order_post(order_payload)
+    status = str(order.get("status") or "").lower()
+    status_detail = str(order.get("status_detail") or "").lower()
+    order_id = str(order.get("id") or "")
+
+    db = get_firestore_db()
+    db.collection("mercadopago_orders").document(dados.referencia).set(
+        {
+            "orderId": order_id,
+            "referencia": dados.referencia,
+            "empresa": dados.empresa,
+            "valor": dados.valor,
+            "metodo": "APPLE_PAY",
+            "status": status,
+            "statusDetail": status_detail,
+            "atualizadoEm": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+    if status == "processed":
+        _sincronizar_cliente_firebase(
+            dados.referencia,
+            novo_status="ATIVO",
+            payment_id=order_id or None,
+        )
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO",
+        "metodo": "APPLE_PAY",
+        "orderId": order_id,
+        "status": status,
+        "statusDetail": status_detail,
+        "approved": status == "processed",
+        "order": order,
     }
 
 
