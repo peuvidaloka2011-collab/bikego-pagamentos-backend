@@ -19,6 +19,7 @@ ASAAS_API_KEY = os.getenv("ASAAS_API_KEY", "").strip()
 ASAAS_ENV = os.getenv("ASAAS_ENV", "sandbox").strip().lower()
 ASAAS_WEBHOOK_TOKEN = os.getenv("ASAAS_WEBHOOK_TOKEN", "").strip()
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "").strip()
+MERCADOPAGO_PUBLIC_KEY = os.getenv("MERCADOPAGO_PUBLIC_KEY", "").strip()
 MERCADOPAGO_TEST_ACCESS_TOKEN = os.getenv("MERCADOPAGO_TEST_ACCESS_TOKEN", "").strip()
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
 PAGBANK_TOKEN = os.getenv("PAGBANK_TOKEN", "").strip()
@@ -348,7 +349,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.5.0")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -371,6 +372,11 @@ class LinkAssinaturaRequest(BaseModel):
         max_length=500,
     )
     referencia: Optional[str] = Field(default=None, max_length=200)
+
+
+class MercadoPagoCardSubscriptionRequest(LinkAssinaturaRequest):
+    email: str = Field(min_length=5, max_length=180)
+    card_token_id: str = Field(min_length=10, max_length=200)
 
 
 class MercadoPagoLinkRequest(LinkAssinaturaRequest):
@@ -610,9 +616,10 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.5.0",
+        "versao": "2.6.0",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
+        "mercadopago_public_key_configurada": bool(MERCADOPAGO_PUBLIC_KEY),
         "firebase_configurado": _firebase_configurado(),
     }
 
@@ -790,6 +797,60 @@ async def criar_link_assinatura_mercadopago_teste(dados: MercadoPagoLinkRequest)
         "referencia": dados.referencia,
         "subscriptionId": resposta.get("id"),
         "url": link,
+        "mercadopago": resposta,
+    }
+
+
+@app.get("/api/mercadopago/public-key")
+def mercadopago_public_key():
+    if not MERCADOPAGO_PUBLIC_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="MERCADOPAGO_PUBLIC_KEY não configurada no servidor.",
+        )
+    return {"ok": True, "public_key": MERCADOPAGO_PUBLIC_KEY}
+
+
+@app.post("/api/assinaturas/mercadopago/cartao")
+async def criar_assinatura_mercadopago_cartao(
+    dados: MercadoPagoCardSubscriptionRequest,
+):
+    """
+    Cria assinatura recorrente diretamente com card_token_id gerado
+    pelo Card Payment Brick no navegador do cliente.
+    O backend nunca recebe número completo do cartão nem CVV.
+    """
+    email = dados.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
+
+    payload = {
+        "reason": "BIKEGO - ARMAZENAMENTO FIREBASE",
+        "external_reference": dados.referencia,
+        "payer_email": email,
+        "card_token_id": dados.card_token_id,
+        "auto_recurring": {
+            "frequency": 1,
+            "frequency_type": "months",
+            "transaction_amount": round(dados.valor, 2),
+            "currency_id": "BRL",
+        },
+        "back_url": MERCADOPAGO_BACK_URL,
+        "status": "authorized",
+    }
+
+    resposta = await mercadopago_post("/preapproval", payload)
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO_TRANSPARENTE",
+        "empresa": dados.empresa,
+        "valor": dados.valor,
+        "referencia": dados.referencia,
+        "subscriptionId": resposta.get("id"),
+        "status": resposta.get("status"),
+        "nextPaymentDate": resposta.get("next_payment_date"),
+        "paymentMethodId": resposta.get("payment_method_id"),
         "mercadopago": resposta,
     }
 
@@ -1309,7 +1370,9 @@ async def webhook_mercadopago(request: Request):
         vencimento = assinatura.get("next_payment_date")
 
         if status_mp == "authorized":
-            novo_status = "ATIVO"
+            # Assinatura autorizada ainda não é confirmação de cobrança.
+            # A liberação acontece em subscription_authorized_payment/payment aprovado.
+            novo_status = None
         elif status_mp in {"paused", "cancelled"}:
             novo_status = "VENCIDO"
 
