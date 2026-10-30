@@ -1138,6 +1138,30 @@ async def preparacao_assinatura_mp_teste():
     }
 
 
+@app.get("/api/mercadopago/teste/preflight")
+async def preflight_assinatura_teste(
+    x_bikego_test_admin_key: Optional[str] = Header(default=None),
+):
+    """Validacao local, sem chamar POST e sem criar assinatura."""
+    if not MERCADOPAGO_TEST_ADMIN_KEY or not x_bikego_test_admin_key or not hmac.compare_digest(
+        x_bikego_test_admin_key, MERCADOPAGO_TEST_ADMIN_KEY
+    ):
+        raise HTTPException(status_code=401, detail="Autorizacao administrativa necessaria.")
+    from urllib.parse import urlparse
+    parsed = urlparse(MERCADOPAGO_BACK_URL)
+    checks = {
+        "seller_id_configurado": bool(MERCADOPAGO_TEST_SELLER_ID),
+        "token_teste_configurado": bool(MERCADOPAGO_TEST_ACCESS_TOKEN),
+        "tokens_distintos": bool(MERCADOPAGO_TEST_ACCESS_TOKEN) and MERCADOPAGO_TEST_ACCESS_TOKEN != MERCADOPAGO_ACCESS_TOKEN,
+        "buyer_email_formato_valido": bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", MERCADOPAGO_TEST_BUYER_EMAIL)),
+        "buyer_email_dominio_teste": MERCADOPAGO_TEST_BUYER_EMAIL.endswith("@testuser.com"),
+        "back_url_https": parsed.scheme == "https" and bool(parsed.netloc),
+        "criacao_habilitada": MERCADOPAGO_TEST_CREATE_ENABLED,
+    }
+    return {"ok": all(checks.values()), "verificacoes": checks,
+            "nota": "Checagem local: nao confirma cadastro do comprador nem permissao para POST /preapproval. Nenhuma assinatura criada."}
+
+
 @app.post("/api/assinaturas/mercadopago/teste/link")
 async def criar_link_assinatura_mercadopago_teste(
     dados: MercadoPagoLinkRequest,
@@ -1184,7 +1208,25 @@ async def criar_link_assinatura_mercadopago_teste(
     }
     # Mesmo com status pending, o recurso e criado no Mercado Pago.
     # A conclusao do checkout sera uma etapa separada.
-    resposta = await mercadopago_post("/preapproval", payload, teste=True)
+    try:
+        resposta = await mercadopago_post("/preapproval", payload, teste=True)
+    except HTTPException as exc:
+        # Nao retorna informacoes do token, comprador ou payload ao navegador.
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        cause = detail.get("cause") if isinstance(detail.get("cause"), list) else []
+        causas = []
+        for item in cause[:5]:
+            if isinstance(item, dict):
+                causas.append({"code": str(item.get("code", ""))[:80],
+                               "description": str(item.get("description", ""))[:180]})
+        raise HTTPException(status_code=exc.status_code, detail={
+            "origem": "mercado_pago",
+            "status": exc.status_code,
+            "codigo": str(detail.get("error") or detail.get("code") or "")[:80],
+            "mensagem": str(detail.get("message") or "Requisicao rejeitada")[:180],
+            "causas": causas,
+            "acao": "Nao repita Execute ate investigar o motivo. Use /api/mercadopago/teste/preflight antes de nova tentativa."
+        }) from exc
     return {
         "ok": True,
         "ambiente": "SELLER_TEST_USER",
