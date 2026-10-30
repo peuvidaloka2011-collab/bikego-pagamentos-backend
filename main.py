@@ -813,7 +813,7 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
         },
         "items": [
             {
-                "name": "BIKEGO - ARMAZENAMENTO FIREBASE",
+                "name": "BIKEGO FIREBASE",
                 "description": dados.descricao,
                 "quantity": 1,
                 "value": round(dados.valor, 2),
