@@ -31,6 +31,9 @@ MERCADOPAGO_TEST_SELLER_ID = os.getenv("MERCADOPAGO_TEST_SELLER_ID", "").strip()
 # Segredos exclusivos da rota controlada de teste; nao reutilize senha da conta.
 MERCADOPAGO_TEST_ADMIN_KEY = os.getenv("MERCADOPAGO_TEST_ADMIN_KEY", "").strip()
 MERCADOPAGO_TEST_BUYER_EMAIL = os.getenv("MERCADOPAGO_TEST_BUYER_EMAIL", "").strip().lower()
+# Liberacao EXCLUSIVA para gerar preferencias avulsas na conta Seller Test User.
+# Nao altera as rotas de assinaturas ou a producao.
+MERCADOPAGO_AVULSO_TEST_ENABLED = os.getenv("MERCADOPAGO_AVULSO_TEST_ENABLED", "false").strip().lower() == "true"
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
 PAGBANK_TOKEN = os.getenv("PAGBANK_TOKEN", "").strip()
 PAGBANK_ENV = os.getenv("PAGBANK_ENV", "production").strip().lower()
@@ -424,6 +427,13 @@ class MercadoPagoOneTimePaymentRequest(BaseModel):
     cardholder_name: Optional[str] = Field(default=None, max_length=120)
     device_id: Optional[str] = Field(default=None, max_length=255)
     request_id: str = Field(min_length=8, max_length=80)
+
+
+class PagamentoAvulsoTesteRequest(BaseModel):
+    # Identificador unico fornecido pelo administrador; nunca usar uma referencia real.
+    referencia: str = Field(min_length=12, max_length=90)
+
+
 
 
 class MercadoPagoLinkRequest(LinkAssinaturaRequest):
@@ -1305,6 +1315,182 @@ async def criar_link_assinatura_mercadopago_teste(
         "valor": 5.0,
         "referencia": dados.referencia.strip(),
         "aviso": "Assinatura pendente criada; nao autorize pagamento sem conferir a conta de teste.",
+    }
+
+
+# ----------------------------------------------------------------------
+# BIKEGO V51 — COBRANCA UNICA / CHECKOUT PRO (SOMENTE CONTA DE TESTE)
+# Nenhuma rota abaixo altera clientes ou licencas no Firebase.
+# ----------------------------------------------------------------------
+
+def _proteger_avulso_teste(chave: Optional[str]) -> None:
+    if not MERCADOPAGO_AVULSO_TEST_ENABLED:
+        raise HTTPException(status_code=403, detail="Teste avulso desativado no Render.")
+    if not MERCADOPAGO_TEST_ADMIN_KEY or len(MERCADOPAGO_TEST_ADMIN_KEY) < 32:
+        raise HTTPException(status_code=503, detail="Configure uma chave administrativa de teste com 32 caracteres ou mais.")
+    if not chave or not hmac.compare_digest(chave, MERCADOPAGO_TEST_ADMIN_KEY):
+        raise HTTPException(status_code=401, detail="Chave administrativa de teste invalida.")
+    if not MERCADOPAGO_TEST_ACCESS_TOKEN or MERCADOPAGO_TEST_ACCESS_TOKEN == MERCADOPAGO_ACCESS_TOKEN:
+        raise HTTPException(status_code=403, detail="As credenciais de teste nao estao separadas da producao.")
+
+
+def _validar_ref_avulso_teste(referencia: str) -> str:
+    ref = referencia.strip().upper()
+    if not re.fullmatch(r"TESTE-AVULSA-[A-Z0-9-]{1,75}", ref):
+        raise HTTPException(
+            status_code=400,
+            detail="Use uma referencia exclusiva no formato TESTE-AVULSA-001.",
+        )
+    return ref
+
+
+@app.get("/api/pagamentos/mercadopago/teste/avulsa/preparacao")
+async def preparacao_avulsa_mp_teste():
+    # Apenas configuracao local; nao cria pagamento.
+    return {
+        "ok": True,
+        "tipo": "PAGAMENTO_UNICO",
+        "valor_teste": 5.0,
+        "enabled": MERCADOPAGO_AVULSO_TEST_ENABLED,
+        "chave_admin_configurada": len(MERCADOPAGO_TEST_ADMIN_KEY) >= 32,
+        "seller_id_configurado": bool(MERCADOPAGO_TEST_SELLER_ID),
+        "token_teste_configurado": bool(MERCADOPAGO_TEST_ACCESS_TOKEN),
+        "token_distinto_da_producao": bool(MERCADOPAGO_TEST_ACCESS_TOKEN)
+            and MERCADOPAGO_TEST_ACCESS_TOKEN != MERCADOPAGO_ACCESS_TOKEN,
+        "altera_firebase": False,
+        "aviso": "Nao gera assinatura, preferencia nem pagamento. Apenas leitura.",
+    }
+
+
+@app.post("/api/pagamentos/mercadopago/teste/fatura-avulsa")
+async def criar_fatura_avulsa_mp_teste(
+    dados: PagamentoAvulsoTesteRequest,
+    x_bikego_test_admin_key: Optional[str] = Header(default=None),
+):
+    """
+    Gera link de pagamento unico de R$ 5,00 no Checkout Pro de TESTE.
+
+    A preferencia criada nao e uma assinatura, nao e uma cobranca aprovada e
+    NAO modifica o Firebase. O comprador confirma no site do Mercado Pago.
+    """
+    _proteger_avulso_teste(x_bikego_test_admin_key)
+    await _verificar_conta_vendedora_teste()
+    ref = _validar_ref_avulso_teste(dados.referencia)
+
+    # Busca a preferencia antes de criar, para evitar duplicar links da
+    # mesma referencia em execucoes repetidas no Swagger.
+    try:
+        busca = await mercadopago_get(
+            "/checkout/preferences/search",
+            params={"external_reference": ref, "limit": 20},
+            teste=True,
+        )
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"motivo": "Nao foi possivel consultar preferencias anteriores. Nenhuma nova preferencia foi criada.",
+                    "codigo_mp": exc.status_code},
+        ) from exc
+
+    encontrados = busca.get("elements") or busca.get("results") or []
+    if isinstance(encontrados, list):
+        for pref in encontrados:
+            if not isinstance(pref, dict) or str(pref.get("external_reference") or "") != ref:
+                continue
+            pref_id = str(pref.get("id") or "")
+            if not pref_id:
+                continue
+            detalhada = await mercadopago_get(
+                f"/checkout/preferences/{pref_id}",
+                teste=True,
+            )
+            return {
+                "ok": True,
+                "reutilizada": True,
+                "tipo": "FATURA_UNICA_TESTE",
+                "valor": 5.0,
+                "referencia": ref,
+                "preference_id": pref_id,
+                "checkout_url": detalhada.get("init_point") or detalhada.get("sandbox_init_point"),
+                "altera_firebase": False,
+            }
+
+    # Preferencia sem token de cartao ou autorizacao de assinatura.
+    payload = {
+        "items": [{
+            "id": "BIKEGO-TESTE-AVULSO",
+            "title": "BIKEGO - Teste de fatura unica",
+            "description": "Teste de pagamento unico, sem renovacao automatica",
+            "quantity": 1,
+            "currency_id": "BRL",
+            "unit_price": 5.0,
+        }],
+        "external_reference": ref,
+        "back_urls": {
+            "success": "https://bikego-pagamentos-web.web.app/",
+            "pending": "https://bikego-pagamentos-web.web.app/",
+            "failure": "https://bikego-pagamentos-web.web.app/",
+        },
+    }
+    try:
+        preferencia = await mercadopago_post(
+            "/checkout/preferences",
+            payload,
+            teste=True,
+            extra_headers={
+                "X-Idempotency-Key": hashlib.sha256(ref.encode("utf-8")).hexdigest()
+            },
+        )
+    except HTTPException as exc:
+        # Nao retornar payload ou credencial no erro.
+        detalhe = exc.detail if isinstance(exc.detail, dict) else {}
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={
+                "origem": "mercado_pago",
+                "codigo_http": exc.status_code,
+                "codigo": detalhe.get("code") or detalhe.get("error"),
+                "mensagem": str(detalhe.get("message") or "Preferencia nao criada")[:180],
+                "acao": "Nao repita Execute com outra referencia sem verificar a consulta de preferencias.",
+            },
+        ) from exc
+
+    return {
+        "ok": True,
+        "reutilizada": False,
+        "tipo": "FATURA_UNICA_TESTE",
+        "valor": 5.0,
+        "referencia": ref,
+        "preference_id": preferencia.get("id"),
+        "checkout_url": preferencia.get("init_point") or preferencia.get("sandbox_init_point"),
+        "altera_firebase": False,
+        "aviso": "Link de teste criado, mas nao ha pagamento aprovado nem desbloqueio de licencas.",
+    }
+
+
+@app.get("/api/pagamentos/mercadopago/teste/avulsa/status/{payment_id}")
+async def status_pagamento_avulso_mp_teste(
+    payment_id: str,
+    x_bikego_test_admin_key: Optional[str] = Header(default=None),
+):
+    """Consulta um pagamento ja realizado; nunca libera licencas."""
+    _proteger_avulso_teste(x_bikego_test_admin_key)
+    await _verificar_conta_vendedora_teste()
+    if not payment_id.isdigit():
+        raise HTTPException(status_code=400, detail="ID de pagamento invalido.")
+    pagamento = await mercadopago_get(f"/v1/payments/{payment_id}", teste=True)
+    referencia = str(pagamento.get("external_reference") or "")
+    if not referencia.startswith("TESTE-AVULSA-"):
+        raise HTTPException(status_code=404, detail="Nao e um pagamento da rotina de teste avulsa.")
+    return {
+        "ok": True,
+        "tipo": "FATURA_UNICA_TESTE",
+        "referencia": referencia,
+        "payment_id": pagamento.get("id"),
+        "status": pagamento.get("status"),
+        "status_detail": pagamento.get("status_detail"),
+        "valor": pagamento.get("transaction_amount"),
+        "altera_firebase": False,
     }
 
 
@@ -2284,6 +2470,16 @@ async def webhook_mercadopago(request: Request):
             "type": tipo,
             "firebaseUpdated": 0,
             "warning": "Evento Mercado Pago sem external_reference.",
+        }
+
+    # Nunca modificar licencas reais quando o evento referencia o
+    # procedimento avulso de teste, mesmo que seja enviado sem ?ambiente=teste.
+    if str(referencia).upper().startswith("TESTE-AVULSA-"):
+        return {
+            "received": True,
+            "ignored": True,
+            "reason": "fatura avulsa de teste",
+            "firebaseUpdated": 0,
         }
 
     # Protecao V48: eventos Mercado Pago somente afetam clientes vinculados
