@@ -349,7 +349,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.6.0")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.6.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -616,7 +616,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.6.0",
+        "versao": "2.6.1",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_public_key_configurada": bool(MERCADOPAGO_PUBLIC_KEY),
@@ -1212,7 +1212,9 @@ async def status_assinatura_mercadopago(
     status_mp = str(assinatura.get("status") or "").lower()
     proxima = _data_br_iso(assinatura.get("next_payment_date"))
 
-    pago = status_mp == "authorized"
+    # "authorized" significa que o cartão/assinatura foi autorizado,
+    # mas a primeira parcela ainda pode estar aguardando processamento.
+    pago = False
     vencido = status_mp in {"paused", "cancelled"}
 
     if subscription_id:
