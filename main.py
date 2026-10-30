@@ -25,6 +25,9 @@ MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "").strip()
 MERCADOPAGO_PUBLIC_KEY = os.getenv("MERCADOPAGO_PUBLIC_KEY", "").strip()
 MERCADOPAGO_TEST_ACCESS_TOKEN = os.getenv("MERCADOPAGO_TEST_ACCESS_TOKEN", "").strip()
 MERCADOPAGO_TEST_PUBLIC_KEY = os.getenv("MERCADOPAGO_TEST_PUBLIC_KEY", "").strip()
+# Desabilitado por padrao: previne criacao acidental de assinatura/cobranca.
+MERCADOPAGO_TEST_CREATE_ENABLED = os.getenv("MERCADOPAGO_TEST_CREATE_ENABLED", "false").strip().lower() == "true"
+MERCADOPAGO_TEST_SELLER_ID = os.getenv("MERCADOPAGO_TEST_SELLER_ID", "").strip()
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
 PAGBANK_TOKEN = os.getenv("PAGBANK_TOKEN", "").strip()
 PAGBANK_ENV = os.getenv("PAGBANK_ENV", "production").strip().lower()
@@ -624,8 +627,10 @@ def mercadopago_headers(teste: bool = False) -> dict:
         "content-type": "application/json",
     }
 
-    if teste:
+    if teste and token.startswith("TEST-"):
         headers["X-scope"] = "stage"
+    # Tokens APP_USR- da conta Seller Test User sao credenciais de
+    # producao *dessa conta de teste*. Nao usar X-scope: stage.
 
     return headers
 
@@ -1040,8 +1045,54 @@ async def diagnostico_mercadopago():
     }
 
 
+async def _verificar_conta_vendedora_teste() -> dict:
+    """Confere titular do token de TESTE no provedor; nunca utiliza token real."""
+    if not MERCADOPAGO_TEST_ACCESS_TOKEN:
+        raise HTTPException(status_code=503, detail="Token do vendedor de teste ausente.")
+    if not MERCADOPAGO_TEST_SELLER_ID or not MERCADOPAGO_TEST_SELLER_ID.isdigit():
+        raise HTTPException(status_code=503, detail="Configure MERCADOPAGO_TEST_SELLER_ID no Render.")
+    if MERCADOPAGO_TEST_ACCESS_TOKEN == MERCADOPAGO_ACCESS_TOKEN:
+        raise HTTPException(status_code=403, detail="Token de teste coincide com producao. Operacao bloqueada.")
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                "https://api.mercadolibre.com/users/me",
+                headers={"Authorization": f"Bearer {MERCADOPAGO_TEST_ACCESS_TOKEN}"},
+            )
+        response.raise_for_status()
+        usuario = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail="Nao foi possivel confirmar titular do token de teste.") from exc
+    if str(usuario.get("id") or "") != MERCADOPAGO_TEST_SELLER_ID:
+        raise HTTPException(status_code=403, detail="ID do vendedor nao corresponde a Seller Test User autorizada.")
+    return {"seller_id_confirmado": True, "conta_testada": True}
+
+
+@app.get("/api/mercadopago/teste/preparacao")
+async def preparacao_assinatura_mp_teste():
+    """Leitura pura: nao cria assinatura, nao altera Firestore, nao revela segredos."""
+    return {
+        "ok": True,
+        "criacao_habilitada": MERCADOPAGO_TEST_CREATE_ENABLED,
+        "seller_id_configurado": bool(MERCADOPAGO_TEST_SELLER_ID),
+        "token_de_teste_configurado": bool(MERCADOPAGO_TEST_ACCESS_TOKEN),
+        "credenciais_distintas": bool(MERCADOPAGO_TEST_ACCESS_TOKEN) and
+            MERCADOPAGO_TEST_ACCESS_TOKEN != MERCADOPAGO_ACCESS_TOKEN,
+        "cabecalho_stage": bool(MERCADOPAGO_TEST_ACCESS_TOKEN.startswith("TEST-")),
+        "aviso": "Nenhum pagamento ou assinatura foi criado. Habilite somente com Seller Test User validado e compradores de teste.",
+    }
+
+
 @app.post("/api/assinaturas/mercadopago/teste/link")
 async def criar_link_assinatura_mercadopago_teste(dados: MercadoPagoLinkRequest):
+    if not MERCADOPAGO_TEST_CREATE_ENABLED:
+        raise HTTPException(status_code=403, detail="Criacao de teste desabilitada no backend por seguranca.")
+    await _verificar_conta_vendedora_teste()
+    # Exige referencia dedicada para impedir atualizacoes de clientes reais.
+    if not dados.referencia.strip().upper().startswith("TESTE-"):
+        raise HTTPException(status_code=400, detail="Referencia deve comecar com TESTE-.")
+    if abs(float(dados.valor) - 5.0) > 0.0001:
+        raise HTTPException(status_code=400, detail="Neste diagnostico o valor permitido e R$ 5,00.")
     # O pagador precisa ser uma conta de teste COMPRADOR do mesmo site/país
     # da conta vendedora. Para Brasil, use uma conta de teste MLB criada no
     # painel do Mercado Pago Developers.
@@ -2000,6 +2051,9 @@ async def webhook_mercadopago(request: Request):
 
     tipo = str(evento.get("type") or "").lower()
     ambiente_teste = request.query_params.get("ambiente", "").lower() == "teste"
+    if ambiente_teste:
+        # Eventos de teste nunca alteram o Firestore de clientes reais.
+        return {"received": True, "ignored": True, "ambiente": "TESTE", "firebaseUpdated": 0}
     referencia = None
     novo_status = None
     vencimento = None
