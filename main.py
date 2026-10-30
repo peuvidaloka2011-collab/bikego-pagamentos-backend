@@ -22,6 +22,7 @@ ASAAS_WEBHOOK_TOKEN = os.getenv("ASAAS_WEBHOOK_TOKEN", "").strip()
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "").strip()
 MERCADOPAGO_PUBLIC_KEY = os.getenv("MERCADOPAGO_PUBLIC_KEY", "").strip()
 MERCADOPAGO_TEST_ACCESS_TOKEN = os.getenv("MERCADOPAGO_TEST_ACCESS_TOKEN", "").strip()
+MERCADOPAGO_TEST_PUBLIC_KEY = os.getenv("MERCADOPAGO_TEST_PUBLIC_KEY", "").strip()
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
 PAGBANK_TOKEN = os.getenv("PAGBANK_TOKEN", "").strip()
 PAGBANK_ENV = os.getenv("PAGBANK_ENV", "production").strip().lower()
@@ -355,7 +356,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.3")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -603,8 +604,6 @@ def mercadopago_headers(teste: bool = False) -> dict:
         "accept": "application/json",
         "content-type": "application/json",
     }
-    if teste:
-        headers["X-scope"] = "stage"
     return headers
 
 
@@ -733,7 +732,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.7.3",
+        "versao": "2.7.4",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_public_key_configurada": bool(MERCADOPAGO_PUBLIC_KEY),
@@ -1118,6 +1117,23 @@ async def applepay_pay(dados: ApplePayPaymentRequest):
     }
 
 
+@app.get("/api/mercadopago/test-public-key")
+def mercadopago_test_public_key():
+    if not MERCADOPAGO_TEST_PUBLIC_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "MERCADOPAGO_TEST_PUBLIC_KEY não configurada no servidor. "
+                "Copie a Public Key do ambiente Teste da mesma aplicação Mercado Pago."
+            ),
+        )
+    return {
+        "ok": True,
+        "ambiente": "TESTE",
+        "public_key": MERCADOPAGO_TEST_PUBLIC_KEY,
+    }
+
+
 @app.get("/api/mercadopago/public-key")
 def mercadopago_public_key():
     if not MERCADOPAGO_PUBLIC_KEY:
@@ -1126,6 +1142,57 @@ def mercadopago_public_key():
             detail="MERCADOPAGO_PUBLIC_KEY não configurada no servidor.",
         )
     return {"ok": True, "public_key": MERCADOPAGO_PUBLIC_KEY}
+
+
+@app.post("/api/assinaturas/mercadopago/teste/cartao")
+async def criar_assinatura_mercadopago_teste_cartao(
+    dados: MercadoPagoCardSubscriptionRequest,
+):
+    """
+    Sandbox da assinatura transparente com cartão.
+    O card_token_id deve ser gerado no navegador com a Public Key de TESTE.
+    """
+    email = dados.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe um e-mail válido do pagador de teste.",
+        )
+
+    payload = {
+        "reason": "FIREBASE ARMAZENAMENTO - TESTE",
+        "external_reference": dados.referencia,
+        "payer_email": email,
+        "card_token_id": dados.card_token_id,
+        "auto_recurring": {
+            "frequency": 1,
+            "frequency_type": "months",
+            "transaction_amount": round(dados.valor, 2),
+            "currency_id": "BRL",
+        },
+        "back_url": MERCADOPAGO_BACK_URL,
+        "status": "authorized",
+    }
+
+    resposta = await mercadopago_post(
+        "/preapproval",
+        payload,
+        teste=True,
+    )
+
+    return {
+        "ok": True,
+        "ambiente": "TESTE",
+        "provedor": "MERCADO_PAGO_TRANSPARENTE_TESTE",
+        "empresa": dados.empresa,
+        "valor": dados.valor,
+        "referencia": dados.referencia,
+        "subscriptionId": resposta.get("id"),
+        "status": resposta.get("status"),
+        "nextPaymentDate": resposta.get("next_payment_date"),
+        "paymentMethodId": resposta.get("payment_method_id"),
+        "mercadopago": resposta,
+    }
 
 
 @app.post("/api/assinaturas/mercadopago/cartao")
