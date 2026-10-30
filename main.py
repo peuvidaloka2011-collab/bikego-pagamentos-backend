@@ -21,6 +21,8 @@ ASAAS_WEBHOOK_TOKEN = os.getenv("ASAAS_WEBHOOK_TOKEN", "").strip()
 MERCADOPAGO_ACCESS_TOKEN = os.getenv("MERCADOPAGO_ACCESS_TOKEN", "").strip()
 MERCADOPAGO_TEST_ACCESS_TOKEN = os.getenv("MERCADOPAGO_TEST_ACCESS_TOKEN", "").strip()
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
+PAGBANK_TOKEN = os.getenv("PAGBANK_TOKEN", "").strip()
+PAGBANK_ENV = os.getenv("PAGBANK_ENV", "production").strip().lower()
 MERCADOPAGO_BACK_URL = os.getenv(
     "MERCADOPAGO_BACK_URL",
     "https://bikego-pagamentos-web.web.app",
@@ -36,6 +38,12 @@ ASAAS_BASE_URL = (
     "https://api.asaas.com/v3"
     if ASAAS_ENV == "production"
     else "https://api-sandbox.asaas.com/v3"
+)
+
+PAGBANK_BASE_URL = (
+    "https://api.pagseguro.com"
+    if PAGBANK_ENV == "production"
+    else "https://sandbox.api.pagseguro.com"
 )
 
 
@@ -340,7 +348,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.4.0")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -406,6 +414,71 @@ async def asaas_get(path: str, params: Optional[dict] = None) -> dict:
     if response.status_code >= 400:
         raise HTTPException(status_code=response.status_code, detail=data)
 
+    return data
+
+
+def pagbank_headers() -> dict:
+    if not PAGBANK_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "PAGBANK_TOKEN não configurado no servidor. "
+                "Adicione o token do PagBank no Render e solicite a liberação "
+                "do método DEBIT_CARD na conta PagBank."
+            ),
+        )
+    return {
+        "Authorization": f"Bearer {PAGBANK_TOKEN}",
+        "accept": "application/json",
+        "content-type": "application/json",
+    }
+
+
+async def pagbank_post(path: str, payload: dict) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{PAGBANK_BASE_URL}{path}",
+                headers=pagbank_headers(),
+                json=payload,
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha de comunicação com o PagBank: {exc}",
+        ) from exc
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=data)
+    return data
+
+
+async def pagbank_get(path: str, params: Optional[dict] = None) -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.get(
+                f"{PAGBANK_BASE_URL}{path}",
+                headers=pagbank_headers(),
+                params=params or {},
+            )
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Falha de comunicação com o PagBank: {exc}",
+        ) from exc
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"raw": response.text}
+
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=data)
     return data
 
 
@@ -537,7 +610,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.4.0",
+        "versao": "2.5.0",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "firebase_configurado": _firebase_configurado(),
@@ -553,6 +626,8 @@ def health():
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_teste_configurado": bool(MERCADOPAGO_TEST_ACCESS_TOKEN),
         "mercadopago_webhook_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
+        "pagbank_configurado": bool(PAGBANK_TOKEN),
+        "pagbank_ambiente": PAGBANK_ENV,
         "mercadopago_notification_url": MERCADOPAGO_NOTIFICATION_URL,
         "firebase_configurado": _firebase_configurado(),
         "firebase_project_id": FIREBASE_PROJECT_ID or None,
@@ -757,6 +832,135 @@ async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
         "subscriptionId": resposta.get("id"),
         "url": link,
         "mercadopago": resposta,
+    }
+
+
+@app.post("/api/pagamentos/pagbank/debito/link")
+async def criar_link_pagamento_debito_pagbank(dados: MercadoPagoLinkRequest):
+    """
+    Gera checkout PagBank aceitando somente cartão de débito.
+    O método DEBIT_CARD depende de liberação/homologação da conta PagBank.
+    """
+    referencia = (dados.referencia or "").strip()
+    if not referencia:
+        raise HTTPException(status_code=400, detail="Referência da cobrança não informada.")
+
+    payload = {
+        "reference_id": referencia,
+        "customer_modifiable": True,
+        "items": [
+            {
+                "reference_id": "bikego_mensalidade",
+                "name": "Mensalidade BIKEGO",
+                "quantity": 1,
+                "unit_amount": int(round(dados.valor * 100)),
+            }
+        ],
+        "payment_methods": [
+            {"type": "DEBIT_CARD"},
+        ],
+        "redirect_url": MERCADOPAGO_BACK_URL,
+        "return_url": MERCADOPAGO_BACK_URL,
+    }
+
+    resposta = await pagbank_post("/checkouts", payload)
+    checkout_id = str(resposta.get("id") or "").strip()
+    links = resposta.get("links") or []
+    link = next(
+        (
+            str(item.get("href") or "")
+            for item in links
+            if str(item.get("rel") or "").upper() == "PAY"
+        ),
+        "",
+    )
+
+    if not checkout_id or not link:
+        raise HTTPException(
+            status_code=502,
+            detail="PagBank não retornou o checkout/link de pagamento.",
+        )
+
+    # Guarda o vínculo para permitir consulta segura do status pelo backend.
+    db = get_firestore_db()
+    db.collection("pagbank_checkouts").document(referencia).set(
+        {
+            "checkoutId": checkout_id,
+            "referencia": referencia,
+            "empresa": dados.empresa,
+            "valor": dados.valor,
+            "metodo": "DEBIT_CARD",
+            "criadoEm": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+    return {
+        "ok": True,
+        "provedor": "PAGBANK",
+        "metodo": "DEBITO",
+        "empresa": dados.empresa,
+        "valor": dados.valor,
+        "referencia": referencia,
+        "checkoutId": checkout_id,
+        "url": link,
+        "pagbank": resposta,
+    }
+
+
+@app.get("/api/pagamentos/pagbank/debito/status/{referencia}")
+async def status_pagamento_debito_pagbank(referencia: str):
+    db = get_firestore_db()
+    doc = db.collection("pagbank_checkouts").document(referencia).get()
+    if not doc.exists:
+        return {
+            "ok": True,
+            "provedor": "PAGBANK",
+            "metodo": "DEBITO",
+            "referencia": referencia,
+            "status": "AGUARDANDO_PAGAMENTO",
+            "pago": False,
+        }
+
+    dados = doc.to_dict() or {}
+    checkout_id = str(dados.get("checkoutId") or "").strip()
+    if not checkout_id:
+        raise HTTPException(status_code=500, detail="Checkout PagBank sem identificador.")
+
+    checkout = await pagbank_get(f"/checkouts/{checkout_id}", params={"limit": 100})
+
+    statuses = []
+    def coletar_status(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "status" and isinstance(v, str):
+                    statuses.append(v.upper())
+                else:
+                    coletar_status(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                coletar_status(item)
+
+    coletar_status(checkout)
+
+    pago = "PAID" in statuses
+    recusado = any(s in {"DECLINED", "CANCELED", "CANCELLED"} for s in statuses)
+    status = "ATIVO" if pago else ("VENCIDO" if recusado else "AGUARDANDO_PAGAMENTO")
+
+    if pago:
+        _sincronizar_cliente_firebase(referencia, novo_status="ATIVO")
+    elif recusado:
+        _sincronizar_cliente_firebase(referencia, novo_status="VENCIDO")
+
+    return {
+        "ok": True,
+        "provedor": "PAGBANK",
+        "metodo": "DEBITO",
+        "referencia": referencia,
+        "checkoutId": checkout_id,
+        "status": status,
+        "pago": pago,
+        "checkoutStatus": checkout.get("status"),
     }
 
 
