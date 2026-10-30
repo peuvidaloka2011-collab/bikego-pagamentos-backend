@@ -4,7 +4,9 @@ import json
 import os
 import re
 import uuid
+from datetime import datetime, timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import firebase_admin
 import httpx
@@ -404,6 +406,7 @@ class MercadoPagoCardSubscriptionRequest(LinkAssinaturaRequest):
 
 class MercadoPagoOneTimePaymentRequest(BaseModel):
     empresa: str = Field(default="BIKEGO", min_length=2, max_length=120)
+    valor: float = Field(gt=0, le=1000)
     referencia: str = Field(min_length=2, max_length=200)
     email: str = Field(min_length=5, max_length=180)
     card_token_id: str = Field(min_length=10, max_length=200)
@@ -790,23 +793,42 @@ def health():
 
 @app.post("/api/assinaturas/link")
 async def criar_link_assinatura(dados: LinkAssinaturaRequest):
-    payload = {
-        "billingType": "CREDIT_CARD",
-        "chargeType": "RECURRENT",
-        "name": "BIKEGO - ARMAZENAMENTO FIREBASE",
-        "description": dados.descricao,
-        "value": round(dados.valor, 2),
-        "subscriptionCycle": "MONTHLY",
-        "notificationEnabled": False,
-    }
+    """
+    Cria o novo Asaas Checkout hospedado para assinatura mensal no cartão.
+    O cliente digita os dados do cartão diretamente no Asaas.
+    """
+    agora_sp = datetime.now(ZoneInfo("America/Sao_Paulo"))
+    primeira_cobranca = agora_sp + timedelta(minutes=2)
 
-    if dados.referencia:
-        payload["externalReference"] = dados.referencia
+    callback_base = MERCADOPAGO_BACK_URL.rstrip("/")
+    payload = {
+        "billingTypes": ["CREDIT_CARD"],
+        "chargeTypes": ["RECURRENT"],
+        "minutesToExpire": 60,
+        "externalReference": dados.referencia,
+        "callback": {
+            "successUrl": f"{callback_base}/?asaas=sucesso",
+            "cancelUrl": f"{callback_base}/?asaas=cancelado",
+            "expiredUrl": f"{callback_base}/?asaas=expirado",
+        },
+        "items": [
+            {
+                "name": "BIKEGO - ARMAZENAMENTO FIREBASE",
+                "description": dados.descricao,
+                "quantity": 1,
+                "value": round(dados.valor, 2),
+            }
+        ],
+        "subscription": {
+            "cycle": "MONTHLY",
+            "nextDueDate": primeira_cobranca.strftime("%Y-%m-%d %H:%M:%S"),
+        },
+    }
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
-                f"{ASAAS_BASE_URL}/paymentLinks",
+                f"{ASAAS_BASE_URL}/checkouts",
                 headers=asaas_headers(),
                 json=payload,
             )
@@ -824,13 +846,53 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
     if response.status_code >= 400:
         raise HTTPException(status_code=response.status_code, detail=resposta)
 
+    checkout_id = str(resposta.get("id") or "").strip()
+    if not checkout_id:
+        raise HTTPException(
+            status_code=502,
+            detail="Asaas não retornou o identificador do novo Checkout.",
+        )
+
+    link = str(resposta.get("link") or "").strip()
+    if not link:
+        base_checkout = (
+            "https://asaas.com/checkoutSession/show"
+            if ASAAS_ENV == "production"
+            else "https://sandbox.asaas.com/checkoutSession/show"
+        )
+        link = f"{base_checkout}?id={checkout_id}"
+
+    # Mantém a relação entre o Checkout do Asaas e o cliente do BIKEGO.
+    # Isso permite tratar CHECKOUT_PAID mesmo se o webhook não repetir
+    # externalReference no objeto checkout.
+    db = get_firestore_db()
+    db.collection("asaas_checkouts").document(checkout_id).set(
+        {
+            "checkoutId": checkout_id,
+            "referencia": dados.referencia or "",
+            "empresa": dados.empresa,
+            "valor": round(dados.valor, 2),
+            "status": str(resposta.get("status") or "ACTIVE"),
+            "url": link,
+            "ambiente": ASAAS_ENV,
+            "criadoEm": firestore.SERVER_TIMESTAMP,
+            "atualizadoEm": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+    resposta_publica = dict(resposta) if isinstance(resposta, dict) else {}
+    resposta_publica["url"] = link
+
     return {
         "ok": True,
         "empresa": dados.empresa,
         "valor": dados.valor,
-        "tipo": "CREDIT_CARD_RECURRENT",
+        "tipo": "ASAAS_CHECKOUT_RECURRENT_CREDIT_CARD",
         "referencia": dados.referencia,
-        "asaas": resposta,
+        "checkoutId": checkout_id,
+        "url": link,
+        "asaas": resposta_publica,
     }
 
 
@@ -1178,7 +1240,7 @@ async def criar_pagamento_mercadopago_cartao_unico(
     dados: MercadoPagoOneTimePaymentRequest,
 ):
     """
-    Diagnóstico de produção: cobra exatamente R$ 5,00 uma única vez.
+    Diagnóstico de produção: cobra um valor informado pelo checkout, uma única vez.
     Não cria assinatura e não altera status/licenças no Firebase.
     """
     email = dados.email.strip().lower()
@@ -1221,9 +1283,9 @@ async def criar_pagamento_mercadopago_cartao_unico(
     additional_payer["authentication_type"] = "WEB"
 
     payload = {
-        "transaction_amount": 5.00,
+        "transaction_amount": round(dados.valor, 2),
         "token": dados.card_token_id,
-        "description": "BIKEGO - TESTE PAGAMENTO UNICO R$ 5,00",
+        "description": f"BIKEGO - TESTE PAGAMENTO UNICO R$ {dados.valor:.2f}",
         "installments": 1,
         "payment_method_id": payment_method_id,
         "payer": payer,
@@ -1237,7 +1299,7 @@ async def criar_pagamento_mercadopago_cartao_unico(
                     "description": "Servico digital de armazenamento e infraestrutura Firebase",
                     "category_id": "digital_goods",
                     "quantity": 1,
-                    "unit_price": 5.00,
+                    "unit_price": round(dados.valor, 2),
                 }
             ],
             **({"payer": additional_payer} if additional_payer else {}),
@@ -1280,7 +1342,7 @@ async def criar_pagamento_mercadopago_cartao_unico(
         "ok": True,
         "provedor": "MERCADO_PAGO",
         "tipo": "PAGAMENTO_UNICO_DIAGNOSTICO",
-        "valor": 5.00,
+        "valor": round(dados.valor, 2),
         "referencia": dados.referencia,
         "paymentId": resposta.get("id"),
         "status": status,
@@ -2024,6 +2086,56 @@ async def webhook_asaas(request: Request):
 
     evento = await request.json()
     nome_evento = str(evento.get("event", "")).upper()
+
+    if nome_evento.startswith("CHECKOUT_"):
+        checkout = evento.get("checkout") or {}
+        checkout_id = str(checkout.get("id") or "").strip()
+        referencia = str(checkout.get("externalReference") or "").strip()
+
+        db = get_firestore_db()
+        checkout_doc = None
+        if checkout_id:
+            checkout_doc = db.collection("asaas_checkouts").document(checkout_id)
+            snap = checkout_doc.get()
+            if snap.exists:
+                salvo = snap.to_dict() or {}
+                if not referencia:
+                    referencia = str(salvo.get("referencia") or "").strip()
+
+        if nome_evento == "CHECKOUT_PAID":
+            novo_status = "ATIVO"
+        elif nome_evento in {"CHECKOUT_CANCELED", "CHECKOUT_EXPIRED"}:
+            novo_status = "AGUARDANDO PAGAMENTO"
+        else:
+            novo_status = None
+
+        if checkout_doc is not None:
+            checkout_doc.set(
+                {
+                    "status": str(checkout.get("status") or ""),
+                    "ultimoEvento": nome_evento,
+                    "atualizadoEm": firestore.SERVER_TIMESTAMP,
+                },
+                merge=True,
+            )
+
+        atualizados = 0
+        if referencia and novo_status is not None:
+            atualizados = _sincronizar_cliente_firebase(
+                referencia,
+                novo_status=novo_status,
+                payment_id=checkout_id or None,
+            )
+
+        return {
+            "received": True,
+            "event": nome_evento,
+            "checkoutId": checkout_id,
+            "externalReference": referencia or None,
+            "firebaseUpdated": atualizados,
+            "statusAplicado": novo_status,
+        }
+
     payment = evento.get("payment") or {}
 
     referencia, payment_full, assinatura = await _contexto_pagamento_asaas(payment)
