@@ -1068,6 +1068,56 @@ async def _verificar_conta_vendedora_teste() -> dict:
     return {"seller_id_confirmado": True, "conta_testada": True}
 
 
+@app.get("/api/mercadopago/teste/validar-vendedor")
+async def validar_vendedor_mercadopago_teste():
+    """Verifica somente a identidade do token de teste, sem criar cobranca.
+
+    Nao retorna dados pessoais, token, nem o ID do titular.
+    """
+    if not MERCADOPAGO_TEST_ACCESS_TOKEN or not MERCADOPAGO_TEST_SELLER_ID:
+        return {"ok": False, "seller_confirmado": False,
+                "motivo": "Configure token e Seller ID de teste no Render."}
+    if MERCADOPAGO_TEST_ACCESS_TOKEN == MERCADOPAGO_ACCESS_TOKEN:
+        return {"ok": False, "seller_confirmado": False,
+                "motivo": "Token de teste igual ao de producao. Verificacao bloqueada."}
+    if not MERCADOPAGO_TEST_SELLER_ID.isdigit():
+        return {"ok": False, "seller_confirmado": False,
+                "motivo": "Seller ID de teste invalido."}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resposta = await client.get(
+                "https://api.mercadolibre.com/users/me",
+                headers={"Authorization": f"Bearer {MERCADOPAGO_TEST_ACCESS_TOKEN}"},
+            )
+    except httpx.TimeoutException:
+        return {"ok": False, "seller_confirmado": False,
+                "motivo": "Timeout ao consultar identificacao do vendedor."}
+    except httpx.HTTPError:
+        return {"ok": False, "seller_confirmado": False,
+                "motivo": "Falha de conexao com a API de identificacao."}
+    if resposta.status_code != 200:
+        return {"ok": False, "seller_confirmado": False,
+                "status_code": resposta.status_code,
+                "motivo": "API de identificacao recusou a consulta."}
+    try:
+        usuario = resposta.json()
+        identificado = str(usuario.get("id") or "")
+    except (ValueError, AttributeError):
+        return {"ok": False, "seller_confirmado": False,
+                "motivo": "Resposta de identificacao invalida."}
+    corresponde = bool(identificado) and hmac.compare_digest(
+        identificado, MERCADOPAGO_TEST_SELLER_ID
+    )
+    return {
+        "ok": corresponde,
+        "seller_confirmado": corresponde,
+        "credenciais_distintas": True,
+        "criacao_habilitada": MERCADOPAGO_TEST_CREATE_ENABLED,
+        "motivo": "Seller confirmado" if corresponde else "Seller ID nao corresponde ao token.",
+        "aviso": "Somente consulta. Nenhuma cobranca foi criada.",
+    }
+
+
 @app.get("/api/mercadopago/teste/preparacao")
 async def preparacao_assinatura_mp_teste():
     """Leitura pura: nao cria assinatura, nao altera Firestore, nao revela segredos."""
