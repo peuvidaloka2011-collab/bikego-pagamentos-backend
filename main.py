@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import re
 import uuid
 from datetime import datetime, timedelta, date
@@ -37,6 +38,7 @@ MERCADOPAGO_TEST_BUYER_EMAIL = os.getenv("MERCADOPAGO_TEST_BUYER_EMAIL", "").str
 MERCADOPAGO_AVULSO_TEST_ENABLED = os.getenv("MERCADOPAGO_AVULSO_TEST_ENABLED", "false").strip().lower() == "true"
 # V52: fluxo de fatura unica de PRODUCAO - desligado ate homologacao.
 BIKEGO_MP_FATURA_UNICA_ENABLED = os.getenv("BIKEGO_MP_FATURA_UNICA_ENABLED", "false").strip().lower() == "true"
+BIKEGO_MP_GUEST_BRICK_ENABLED = os.getenv("BIKEGO_MP_GUEST_BRICK_ENABLED", "false").strip().lower() == "true"
 BIKEGO_MP_LEGACY_CREATE_ENABLED = os.getenv("BIKEGO_MP_LEGACY_CREATE_ENABLED", "false").strip().lower() == "true"
 BIKEGO_ADMIN_UID = os.getenv("BIKEGO_ADMIN_UID", "").strip()
 MERCADOPAGO_PRODUCTION_SELLER_ID = os.getenv("MERCADOPAGO_PRODUCTION_SELLER_ID", "").strip()
@@ -1511,6 +1513,13 @@ async def v52_gerar_fatura(dados: V52NovaFaturaRequest, authorization: Optional[
         # Nao criar nova ate reconciliar essa tentativa.
         raise HTTPException(409, "Fatura ja reservada e sem link. Confira a preferencia no Mercado Pago; nao gere duplicata.")
 
+    # Somente NOVAS faturas recebem link sem conta. Um pagamento Pix ja feito
+    # nunca e sobrescrito/reemitido por esta atualizacao.
+    guest_access = secrets.token_urlsafe(32) if BIKEGO_MP_GUEST_BRICK_ENABLED else ""
+    guest_url = (
+        "https://bikego-pagamentos-web.web.app/pagar_fatura.html"
+        f"?ref={referencia}&access={guest_access}"
+    ) if guest_access else ""
     # Reserva atomica para impedir duas preferencias do mesmo periodo.
     # create() falha se outro administrador ja reservou o documento.
     try:
@@ -1519,6 +1528,8 @@ async def v52_gerar_fatura(dados: V52NovaFaturaRequest, authorization: Optional[
             "periodo": periodo, "vencimentoFatura": vencimento.strftime("%d/%m/%Y"),
             "valorCentavos": cents, "emailPagamento": email,
             "status": "CRIANDO", "provedor": "MERCADO_PAGO_AVULSO",
+            "guestAccessHash": hashlib.sha256(guest_access.encode()).hexdigest() if guest_access else "",
+            "guestCheckoutUrl": guest_url,
             "criadaEm": firestore.SERVER_TIMESTAMP,
         })
     except Exception:
@@ -1556,9 +1567,9 @@ async def v52_gerar_fatura(dados: V52NovaFaturaRequest, authorization: Optional[
                     "preferenciaId": str(pref.get("id") or ""),
                     "atualizadaEm": firestore.SERVER_TIMESTAMP}, merge=True)
     cliente_ref.set({"referenciaAssinatura": referencia,
-                     "linkAssinatura": url, "provedorPagamento": "MERCADO_PAGO_AVULSO",
+                     "linkAssinatura": guest_url or url, "provedorPagamento": "MERCADO_PAGO_AVULSO",
                      "metodoPagamento": "CREDITO", "atualizadoEm": firestore.SERVER_TIMESTAMP}, merge=True)
-    return {"ok": True, "referencia": referencia, "url": url,
+    return {"ok": True, "referencia": referencia, "url": guest_url or url,
             "valor": cents / 100, "status": "PENDENTE", "tipo": "PAGAMENTO_UNICO",
             "aviso": "Fatura emitida; cliente so sera liberado apos pagamento aprovado."}
 
@@ -1888,6 +1899,235 @@ async def status_pagamento_avulso_mp_teste(
         "valor": pagamento.get("transaction_amount"),
         "altera_firebase": False,
     }
+
+
+
+# V55 — Pagamento sem conta com Payment Brick (cartao e Pix).
+# O comprador recebe um segredo limitado a UMA fatura e nunca ve o Access Token.
+# Toda cobranca e validada pelo backend; o front-end nao escolhe valor/empresa.
+
+def _v55_fatura_segura(referencia: str, access: str):
+    if not re.fullmatch(r"BIKEGO-FAT-[0-9A-F]{20}-\d{6}", referencia):
+        raise HTTPException(404, "Fatura nao encontrada.")
+    if len(access or "") < 32:
+        raise HTTPException(403, "Acesso de pagamento invalido.")
+    snap = get_firestore_db().collection("faturas_mp").document(referencia).get()
+    if not snap.exists:
+        raise HTTPException(404, "Fatura nao encontrada.")
+    fatura = snap.to_dict() or {}
+    hash_esperado = str(fatura.get("guestAccessHash") or "")
+    hash_recebido = hashlib.sha256(access.encode()).hexdigest()
+    if not hash_esperado or not hmac.compare_digest(hash_esperado, hash_recebido):
+        raise HTTPException(403, "Link de pagamento nao autorizado.")
+    if fatura.get("provedor") != "MERCADO_PAGO_AVULSO":
+        raise HTTPException(409, "Provedor incompativel.")
+    return snap.reference, fatura
+
+
+@app.get("/api/v55/checkout/preparacao")
+def v55_checkout_preparacao():
+    return {"ok": True, "guest_brick_habilitado": BIKEGO_MP_GUEST_BRICK_ENABLED,
+            "public_key_configurada": bool(MERCADOPAGO_PUBLIC_KEY),
+            "producao_configurada": bool(MERCADOPAGO_ACCESS_TOKEN),
+            "aviso": "Somente leitura; nao cria pagamentos nem libera licencas."}
+
+
+@app.get("/api/v55/checkout/fatura/{referencia}")
+def v55_checkout_info(referencia: str, access: str):
+    ref, fatura = _v55_fatura_segura(referencia, access)
+    _v52_operacional()
+    if not BIKEGO_MP_GUEST_BRICK_ENABLED:
+        raise HTTPException(503, "Cartao sem conta ainda nao habilitado.")
+    status = str(fatura.get("status") or "")
+    return {
+        "ok": True, "referencia": referencia,
+        "valor": round(int(fatura.get("valorCentavos") or 0) / 100, 2),
+        "moeda": "BRL", "status": status,
+        "email": str(fatura.get("emailPagamento") or ""),
+        "public_key": MERCADOPAGO_PUBLIC_KEY,
+        "pixCheckoutUrl": str(fatura.get("checkoutUrl") or ""),
+        "pagamentoRegistrado": bool(fatura.get("brickPaymentId")),
+        "pagamentoId": str(fatura.get("brickPaymentId") or ""),
+        "pago": status == "PAGO",
+    }
+
+
+class V55BrickPaymentRequest(BaseModel):
+    access: str = Field(min_length=32, max_length=180)
+    attempt_id: str = Field(min_length=12, max_length=100)
+    form_data: dict
+    email: str = Field(min_length=5, max_length=180)
+
+
+@app.post("/api/v55/checkout/fatura/{referencia}/pagar")
+async def v55_checkout_pagar(referencia: str, dados: V55BrickPaymentRequest):
+    if not BIKEGO_MP_GUEST_BRICK_ENABLED:
+        raise HTTPException(403, "Pagamento sem conta ainda nao habilitado.")
+    _v52_operacional()
+    fatura_ref, fatura = _v55_fatura_segura(referencia, dados.access)
+    if fatura.get("status") == "PAGO":
+        return {"ok": True, "status": "approved", "ja_paga": True,
+                "mensagem": "Fatura ja paga; nao envie outro pagamento."}
+    if fatura.get("status") != "PENDENTE":
+        raise HTTPException(409, "Fatura nao esta disponivel para pagamento.")
+    if fatura.get("brickPaymentId"):
+        return {"ok": True, "status": "em_verificacao",
+                "payment_id": str(fatura.get("brickPaymentId")),
+                "mensagem": "Ja existe pagamento registrado. Consulte a situacao antes de tentar novamente."}
+
+    # Antes de aceitar novo cartao, confirme que o PIX/Checkout Pro antigo
+    # nao foi aprovado. Se a API falhar, bloqueie para evitar pagamento duplo.
+    pagamentos_anteriores = await mercadopago_get(
+        "/v1/payments/search", params={"external_reference": referencia, "limit": 30}
+    )
+    for anterior in pagamentos_anteriores.get("results") or []:
+        pid = str(anterior.get("id") or "")
+        situacao = str(anterior.get("status") or "").lower()
+        if situacao == "approved" and pid:
+            try:
+                await _v52_conciliar_pagamento(pid)
+            except HTTPException:
+                pass  # Nunca cobrar novamente enquanto houver pagamento aprovado.
+            return {"ok": True, "status": "approved", "ja_paga": True,
+                    "mensagem": "Foi identificado pagamento anterior aprovado. Nao cobre novamente."}
+        if situacao in {"pending", "in_process", "authorized"}:
+            return {"ok": True, "status": "em_verificacao",
+                    "mensagem": "Pagamento anterior ainda pendente. Nao cobre novamente."}
+    if not re.fullmatch(r"[a-zA-Z0-9_-]{12,100}", dados.attempt_id):
+        raise HTTPException(400, "Identificador de tentativa invalido.")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", dados.email.strip()):
+        raise HTTPException(400, "Informe um email valido do pagador.")
+
+    form = dados.form_data
+    metodo = str(form.get("payment_method_id") or "").strip().lower()
+    token_cartao = str(form.get("token") or "").strip()
+    pix = metodo == "pix"
+    if not pix and (not token_cartao or len(token_cartao) > 120):
+        raise HTTPException(400, "Token do cartao nao fornecido pelo Mercado Pago.")
+    if not pix and not re.fullmatch(r"[a-z0-9_-]{2,30}", metodo):
+        raise HTTPException(400, "Meio de pagamento invalido.")
+    parcelamento = int(form.get("installments") or 1)
+    if parcelamento != 1:
+        raise HTTPException(400, "Faturas BIKEGO permitem pagamento em uma parcela.")
+
+    # Firestore atomicamente reserva a tentativa; nao permite duas chamadas
+    # simultaneas cobrarem a mesma fatura. Em caso de erro desconhecido,
+    # a reserva permanece para conciliacao manual.
+    db = get_firestore_db()
+    import datetime as py_datetime
+    now = py_datetime.datetime.now(py_datetime.timezone.utc)
+    lease = now + py_datetime.timedelta(minutes=8)
+    @firestore.transactional
+    def reservar(tx):
+        snap = fatura_ref.get(transaction=tx)
+        if not snap.exists:
+            return "inexistente"
+        current = snap.to_dict() or {}
+        if current.get("status") == "PAGO":
+            return "pago"
+        if current.get("brickPaymentId"):
+            return "pagamento_existente"
+        exp = current.get("brickLockUntil")
+        if exp and getattr(exp, "tzinfo", None) is not None and exp > now:
+            return "ocupado"
+        # Se houve falha de rede sem resposta, nao repetir automaticamente:
+        # o Mercado Pago pode ter criado a cobranca.
+        if current.get("brickLockIncerteza"):
+            return "incerto"
+        tentativas = int(current.get("brickTentativas") or 0)
+        if tentativas >= 3:
+            return "limite"
+        tx.update(fatura_ref, {"brickLockUntil": lease,
+                               "brickAttemptId": dados.attempt_id,
+                               "brickLockIncerteza": True,
+                               "brickTentativas": tentativas + 1})
+        return "reservado"
+    reservado = reservar(db.transaction())
+    if reservado == "pago":
+        return {"ok": True, "status": "approved", "ja_paga": True}
+    if reservado != "reservado":
+        raise HTTPException(409, f"Pagamento nao pode ser repetido: {reservado}. Consulte o status da fatura.")
+
+    payer = {"email": dados.email.strip().lower()}
+    identification = (form.get("payer") or {}).get("identification") or {}
+    cpf_num = re.sub(r"\D", "", str(identification.get("number") or ""))
+    cpf_tipo = str(identification.get("type") or "CPF")
+    if cpf_num:
+        payer["identification"] = {"type": cpf_tipo, "number": cpf_num}
+    body = {
+        "transaction_amount": round(int(fatura["valorCentavos"]) / 100, 2),
+        "description": "BIKEGO - Mensalidade de aplicativos",
+        "payment_method_id": metodo,
+        "payer": payer,
+        "external_reference": referencia,
+        "installments": 1,
+        "notification_url": MERCADOPAGO_NOTIFICATION_URL,
+    }
+    if not pix:
+        body["token"] = token_cartao
+        issuer = form.get("issuer_id")
+        if issuer:
+            body["issuer_id"] = str(issuer)
+    try:
+        resposta = await mercadopago_post(
+            "/v1/payments", body,
+            extra_headers={"X-Idempotency-Key": hashlib.sha256(
+                (referencia + ":" + dados.attempt_id).encode()
+            ).hexdigest()},
+        )
+    except HTTPException as exc:
+        # 4xx confirmado pelo MP pode ser uma recusa conhecida; 5xx ou falha
+        # de rede deve continuar bloqueada ate conciliacao administrativa.
+        if 400 <= exc.status_code < 500:
+            fatura_ref.set({"brickLockUntil": None,
+                            "brickLockIncerteza": False,
+                            "brickErroUltimo": str(exc.status_code),
+                            "atualizadaEm": firestore.SERVER_TIMESTAMP}, merge=True)
+        raise HTTPException(exc.status_code,
+                            {"mensagem": "Pagamento recusado pelo Mercado Pago. Confira o cartao e nao repita imediatamente.",
+                             "codigo_http": exc.status_code}) from exc
+
+    status = str(resposta.get("status") or "").lower()
+    payment_id = str(resposta.get("id") or "")
+    if not payment_id:
+        raise HTTPException(502, "Situacao desconhecida. Nao repita o pagamento; consulte a fatura.")
+    changes = {"brickPaymentId": payment_id,
+               "brickStatusMp": status,
+               "brickLockUntil": None,
+               "brickLockIncerteza": False,
+               "atualizadaEm": firestore.SERVER_TIMESTAMP}
+    if pix:
+        dados_pix = (resposta.get("point_of_interaction") or {}).get("transaction_data") or {}
+        changes["brickPixQrCode"] = str(dados_pix.get("qr_code") or "")[:5000]
+        changes["brickPixQrLink"] = str(dados_pix.get("ticket_url") or "")[:800]
+    fatura_ref.set(changes, merge=True)
+    if status == "approved":
+        try:
+            await _v52_conciliar_pagamento(payment_id)
+        except HTTPException:
+            # Aprovado no MP, mas eventual falha Firebase exige conciliacao.
+            pass
+    if status == "rejected":
+        fatura_ref.set({"brickPaymentId": None}, merge=True)
+    return {
+        "ok": True, "status": status, "payment_id": payment_id,
+        "qr_code": changes.get("brickPixQrCode") if pix else None,
+        "ticket_url": changes.get("brickPixQrLink") if pix else None,
+        "mensagem": "Aguarde confirmacao pelo servidor; nao tente pagar outra vez.",
+    }
+
+
+@app.get("/api/v55/checkout/fatura/{referencia}/situacao")
+async def v55_checkout_situacao(referencia: str, access: str):
+    fatura_ref, dados = _v55_fatura_segura(referencia, access)
+    pagamento_id = str(dados.get("brickPaymentId") or "")
+    # A leitura da fatura nao deve aprovar pagamento baseada apenas no browser.
+    return {"ok": True, "pago": dados.get("status") == "PAGO",
+            "status": dados.get("status"),
+            "statusMp": dados.get("brickStatusMp"),
+            "payment_id": pagamento_id,
+            "pixQrCode": str(dados.get("brickPixQrCode") or "") if pagamento_id else None,
+            "pixTicketUrl": str(dados.get("brickPixQrLink") or "") if pagamento_id else None}
 
 
 @app.get("/api/applepay/config")
