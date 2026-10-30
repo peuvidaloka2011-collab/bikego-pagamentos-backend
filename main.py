@@ -780,7 +780,6 @@ def health():
         "webhook_token_configurado": bool(ASAAS_WEBHOOK_TOKEN),
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_teste_configurado": bool(MERCADOPAGO_TEST_ACCESS_TOKEN),
-        "mercadopago_teste_public_key_configurada": bool(MERCADOPAGO_TEST_PUBLIC_KEY),
         "mercadopago_webhook_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
         "pagbank_configurado": bool(PAGBANK_TOKEN),
         "pagbank_ambiente": PAGBANK_ENV,
@@ -899,32 +898,48 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
 
 @app.get("/api/mercadopago/teste/diagnostico")
 async def diagnostico_mercadopago_teste():
+    """Compara autenticação GET sem realizar cobranças ou expor segredos."""
     if not MERCADOPAGO_TEST_ACCESS_TOKEN:
-        return {
-            "ok": False,
-            "configurado": False,
-            "mensagem": "MERCADOPAGO_TEST_ACCESS_TOKEN não configurado.",
-        }
+        return {"ok": False, "configurado": False, "ambiente": "TESTE"}
 
-    try:
-        resposta = await mercadopago_get("/preapproval/search", params={"limit": 1}, teste=True)
-        return {
-            "ok": True,
-            "configurado": True,
-            "assinaturas_api": "AUTORIZADA",
-            "ambiente": "TESTE",
-            "resultados": len(resposta.get("results") or []),
-        }
-    except HTTPException as exc:
-        return {
-            "ok": False,
-            "configurado": True,
-            "assinaturas_api": "NAO_AUTORIZADA",
-            "ambiente": "TESTE",
-            "status_code": exc.status_code,
-            "detail": exc.detail,
-        }
+    tipo = ("TEST-" if MERCADOPAGO_TEST_ACCESS_TOKEN.startswith("TEST-") else
+            "APP_USR-" if MERCADOPAGO_TEST_ACCESS_TOKEN.startswith("APP_USR-") else
+            "OUTRO")
+    resultados = {}
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        for rotulo, com_stage in (("com_x_scope_stage", True), ("sem_x_scope_stage", False)):
+            headers = {
+                "Authorization": f"Bearer {MERCADOPAGO_TEST_ACCESS_TOKEN}",
+                "Accept": "application/json",
+            }
+            if com_stage:
+                headers["X-scope"] = "stage"
+            try:
+                r = await client.get(
+                    f"{MERCADOPAGO_BASE_URL}/preapproval/search",
+                    headers=headers, params={"limit": 1},
+                )
+                try:
+                    corpo = r.json()
+                except ValueError:
+                    corpo = {}
+                resultados[rotulo] = {
+                    "status_http": r.status_code,
+                    "autorizado": 200 <= r.status_code < 300,
+                    "codigo_erro": corpo.get("code") if isinstance(corpo, dict) else None,
+                    "bloqueado_por": corpo.get("blocked_by") if isinstance(corpo, dict) else None,
+                }
+            except httpx.RequestError as e:
+                resultados[rotulo] = {"erro_rede": type(e).__name__}
 
+    return {
+        "ok": any(v.get("autorizado") for v in resultados.values()),
+        "configurado": True,
+        "ambiente": "TESTE",
+        "tipo_token": tipo,
+        "diagnostico": resultados,
+        "observacao": "GET autorizado não garante permissão para POST /preapproval.",
+    }
 
 
 def _modo_credencial_mp(valor: str) -> str:
@@ -2045,20 +2060,6 @@ async def webhook_mercadopago(request: Request):
             "type": tipo,
             "firebaseUpdated": 0,
             "warning": "Evento Mercado Pago sem external_reference.",
-        }
-
-    # SEGURANCA: eventos de teste nunca alteram contratos/clientes reais.
-    # Retornamos a confirmacao ao Mercado Pago para evitar reentregas,
-    # mas registramos o estado apenas na resposta (sem escrita no Firebase).
-    if ambiente_teste:
-        return {
-            "received": True,
-            "ambiente": "TESTE",
-            "type": tipo,
-            "externalReference": referencia,
-            "firebaseUpdated": 0,
-            "statusSimulado": novo_status,
-            "aviso": "Evento de teste processado sem modificar cliente de producao.",
         }
 
     atualizados = _sincronizar_cliente_firebase(
