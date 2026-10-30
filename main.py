@@ -1239,6 +1239,40 @@ async def criar_pagamento_mercadopago_cartao_unico(
     }
 
 
+@app.get("/api/pagamentos/mercadopago/cartao-unico/{payment_id}")
+async def consultar_pagamento_mercadopago_cartao_unico(payment_id: str):
+    """
+    Consulta o status de um pagamento único já criado no Mercado Pago.
+    Não gera nova cobrança e não altera status/licenças no Firebase.
+    """
+    pid = (payment_id or "").strip()
+    if not re.fullmatch(r"\d+", pid):
+        raise HTTPException(
+            status_code=400,
+            detail="ID de pagamento inválido.",
+        )
+
+    resposta = await mercadopago_get(f"/v1/payments/{pid}")
+    status = str(resposta.get("status") or "").lower()
+    status_detail = str(resposta.get("status_detail") or "")
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO",
+        "tipo": "CONSULTA_PAGAMENTO_UNICO_DIAGNOSTICO",
+        "paymentId": resposta.get("id"),
+        "status": status,
+        "statusDetail": status_detail,
+        "approved": status == "approved",
+        "rejected": status == "rejected",
+        "inProcess": status in {"in_process", "pending"},
+        "valor": resposta.get("transaction_amount"),
+        "referencia": resposta.get("external_reference"),
+        "dateCreated": resposta.get("date_created"),
+        "dateApproved": resposta.get("date_approved"),
+    }
+
+
 @app.post("/api/assinaturas/mercadopago/teste/cartao")
 async def criar_assinatura_mercadopago_teste_cartao(
     dados: MercadoPagoCardSubscriptionRequest,
