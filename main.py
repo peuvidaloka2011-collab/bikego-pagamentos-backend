@@ -12,7 +12,7 @@ import firebase_admin
 import httpx
 from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -28,6 +28,9 @@ MERCADOPAGO_TEST_PUBLIC_KEY = os.getenv("MERCADOPAGO_TEST_PUBLIC_KEY", "").strip
 # Desabilitado por padrao: previne criacao acidental de assinatura/cobranca.
 MERCADOPAGO_TEST_CREATE_ENABLED = os.getenv("MERCADOPAGO_TEST_CREATE_ENABLED", "false").strip().lower() == "true"
 MERCADOPAGO_TEST_SELLER_ID = os.getenv("MERCADOPAGO_TEST_SELLER_ID", "").strip()
+# Segredos exclusivos da rota controlada de teste; nao reutilize senha da conta.
+MERCADOPAGO_TEST_ADMIN_KEY = os.getenv("MERCADOPAGO_TEST_ADMIN_KEY", "").strip()
+MERCADOPAGO_TEST_BUYER_EMAIL = os.getenv("MERCADOPAGO_TEST_BUYER_EMAIL", "").strip().lower()
 MERCADOPAGO_WEBHOOK_SECRET = os.getenv("MERCADOPAGO_WEBHOOK_SECRET", "").strip()
 PAGBANK_TOKEN = os.getenv("PAGBANK_TOKEN", "").strip()
 PAGBANK_ENV = os.getenv("PAGBANK_ENV", "production").strip().lower()
@@ -1124,6 +1127,8 @@ async def preparacao_assinatura_mp_teste():
     return {
         "ok": True,
         "criacao_habilitada": MERCADOPAGO_TEST_CREATE_ENABLED,
+        "chave_admin_configurada": len(MERCADOPAGO_TEST_ADMIN_KEY) >= 32,
+        "buyer_email_configurado": bool(MERCADOPAGO_TEST_BUYER_EMAIL),
         "seller_id_configurado": bool(MERCADOPAGO_TEST_SELLER_ID),
         "token_de_teste_configurado": bool(MERCADOPAGO_TEST_ACCESS_TOKEN),
         "credenciais_distintas": bool(MERCADOPAGO_TEST_ACCESS_TOKEN) and
@@ -1134,57 +1139,61 @@ async def preparacao_assinatura_mp_teste():
 
 
 @app.post("/api/assinaturas/mercadopago/teste/link")
-async def criar_link_assinatura_mercadopago_teste(dados: MercadoPagoLinkRequest):
+async def criar_link_assinatura_mercadopago_teste(
+    dados: MercadoPagoLinkRequest,
+    x_bikego_test_admin_key: Optional[str] = Header(default=None),
+):
+    """Cria SOMENTE assinatura pendente no Seller Test User validado.
+
+    A rota exige habilitacao no Render, segredo administrativo separado e
+    email exato do comprador de teste. Nenhum cartao e coletado ou cobrado.
+    """
     if not MERCADOPAGO_TEST_CREATE_ENABLED:
-        raise HTTPException(status_code=403, detail="Criacao de teste desabilitada no backend por seguranca.")
-    await _verificar_conta_vendedora_teste()
-    # Exige referencia dedicada para impedir atualizacoes de clientes reais.
+        raise HTTPException(status_code=403, detail="Criacao de teste desabilitada.")
+    if len(MERCADOPAGO_TEST_ADMIN_KEY) < 32:
+        raise HTTPException(status_code=503, detail="Configure MERCADOPAGO_TEST_ADMIN_KEY com pelo menos 32 caracteres.")
+    if not x_bikego_test_admin_key or not hmac.compare_digest(
+        x_bikego_test_admin_key, MERCADOPAGO_TEST_ADMIN_KEY
+    ):
+        raise HTTPException(status_code=401, detail="Autorizacao administrativa necessaria.")
+    if not MERCADOPAGO_TEST_BUYER_EMAIL or "@" not in MERCADOPAGO_TEST_BUYER_EMAIL:
+        raise HTTPException(status_code=503, detail="Configure MERCADOPAGO_TEST_BUYER_EMAIL da conta Buyer Test User.")
+    if MERCADOPAGO_TEST_ACCESS_TOKEN == MERCADOPAGO_ACCESS_TOKEN:
+        raise HTTPException(status_code=403, detail="Credenciais de teste e producao coincidem.")
     if not dados.referencia.strip().upper().startswith("TESTE-"):
-        raise HTTPException(status_code=400, detail="Referencia deve comecar com TESTE-.")
+        raise HTTPException(status_code=400, detail="Referencia deve iniciar por TESTE-.")
     if abs(float(dados.valor) - 5.0) > 0.0001:
-        raise HTTPException(status_code=400, detail="Neste diagnostico o valor permitido e R$ 5,00.")
-    # O pagador precisa ser uma conta de teste COMPRADOR do mesmo site/país
-    # da conta vendedora. Para Brasil, use uma conta de teste MLB criada no
-    # painel do Mercado Pago Developers.
-    email = dados.email.strip().lower()
-    if "@" not in email:
-        raise HTTPException(
-            status_code=400,
-            detail="Informe o e-mail da conta de teste COMPRADOR do Mercado Pago.",
-        )
+        raise HTTPException(status_code=400, detail="Valor permitido nesta rota: R$ 5,00.")
+    if not hmac.compare_digest(dados.email.strip().lower(), MERCADOPAGO_TEST_BUYER_EMAIL):
+        raise HTTPException(status_code=400, detail="Comprador diferente do Buyer Test User configurado.")
+    await _verificar_conta_vendedora_teste()
 
     payload = {
-        "reason": "BIKEGO - TESTE ARMAZENAMENTO FIREBASE",
-        "external_reference": dados.referencia,
-        "payer_email": email,
+        "reason": "BIKEGO - TESTE DE ASSINATURA",
+        "external_reference": dados.referencia.strip(),
+        "payer_email": MERCADOPAGO_TEST_BUYER_EMAIL,
         "auto_recurring": {
             "frequency": 1,
             "frequency_type": "months",
-            "transaction_amount": round(dados.valor, 2),
+            "transaction_amount": 5.0,
             "currency_id": "BRL",
         },
         "back_url": MERCADOPAGO_BACK_URL,
-        "notification_url": f"{MERCADOPAGO_NOTIFICATION_URL}?ambiente=teste",
         "status": "pending",
+        # Nenhum webhook e enviado ao sistema de licencas real nesta etapa.
     }
-
+    # Mesmo com status pending, o recurso e criado no Mercado Pago.
+    # A conclusao do checkout sera uma etapa separada.
     resposta = await mercadopago_post("/preapproval", payload, teste=True)
-    link = resposta.get("init_point")
-    if not link:
-        raise HTTPException(
-            status_code=502,
-            detail="Mercado Pago teste não retornou o link da assinatura.",
-        )
-
     return {
         "ok": True,
-        "provedor": "MERCADO_PAGO_TESTE",
-        "empresa": dados.empresa,
-        "valor": dados.valor,
-        "referencia": dados.referencia,
+        "ambiente": "SELLER_TEST_USER",
+        "status": resposta.get("status"),
         "subscriptionId": resposta.get("id"),
-        "url": link,
-        "mercadopago": resposta,
+        "url": resposta.get("init_point"),
+        "valor": 5.0,
+        "referencia": dados.referencia.strip(),
+        "aviso": "Assinatura pendente criada; nao autorize pagamento sem conferir a conta de teste.",
     }
 
 
