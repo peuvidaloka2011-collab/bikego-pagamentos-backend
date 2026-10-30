@@ -355,7 +355,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.1")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -733,7 +733,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.7.1",
+        "versao": "2.7.2",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_public_key_configurada": bool(MERCADOPAGO_PUBLIC_KEY),
