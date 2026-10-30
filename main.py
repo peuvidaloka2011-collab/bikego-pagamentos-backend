@@ -1162,6 +1162,75 @@ async def preflight_assinatura_teste(
             "nota": "Checagem local: nao confirma cadastro do comprador nem permissao para POST /preapproval. Nenhuma assinatura criada."}
 
 
+@app.get("/api/mercadopago/teste/diagnostico-400")
+async def diagnostico_400_sem_cobranca(
+    x_bikego_test_admin_key: Optional[str] = Header(default=None),
+):
+    """Leitura apenas; nao cria assinatura e nao expoe comprador/segredos.
+
+    Confere cabecalhos e estrutura da requisicao; tenta consultar a lista de
+    assinaturas na conta Seller Test User para ajudar a detectar duplicidade.
+    Uma consulta autorizada nao garante que POST /preapproval sera aceito.
+    """
+    if (len(MERCADOPAGO_TEST_ADMIN_KEY) < 32 or not x_bikego_test_admin_key
+            or not hmac.compare_digest(x_bikego_test_admin_key, MERCADOPAGO_TEST_ADMIN_KEY)):
+        raise HTTPException(status_code=401, detail="Autorizacao administrativa necessaria.")
+    from urllib.parse import urlparse
+    retorno = urlparse(MERCADOPAGO_BACK_URL)
+    cabecalhos = mercadopago_headers(teste=True)
+    esperado = {
+        "reason": "BIKEGO - TESTE DE ASSINATURA",
+        "external_reference": "TESTE-BIKEGO-006",
+        "payer_email": MERCADOPAGO_TEST_BUYER_EMAIL,
+        "auto_recurring": {
+            "frequency": 1, "frequency_type": "months",
+            "transaction_amount": 5.0, "currency_id": "BRL"
+        },
+        "back_url": MERCADOPAGO_BACK_URL,
+        "status": "pending",
+    }
+    resumo = {
+        "metodo": "POST",
+        "endpoint": "/preapproval",
+        "valor": esperado["auto_recurring"]["transaction_amount"],
+        "frequencia": "mensal",
+        "status_inicial": "pending",
+        "email_comprador_oculto": True,
+        "email_formato_valido": bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", esperado["payer_email"])),
+        "retorno_https": retorno.scheme == "https" and bool(retorno.netloc),
+        "x_scope_stage_enviado": "X-scope" in cabecalhos,
+        "token_teste_diferente_do_real": bool(MERCADOPAGO_TEST_ACCESS_TOKEN)
+            and MERCADOPAGO_TEST_ACCESS_TOKEN != MERCADOPAGO_ACCESS_TOKEN,
+        "identidade_do_comprador_verificada_pela_api": False,
+    }
+    # Nao exponha emails, IDs de assinaturas ou dados privados no endpoint.
+    consulta = {"executada": False, "autorizada": False}
+    try:
+        resposta = await mercadopago_get(
+            "/preapproval/search", params={"limit": 10, "offset": 0}, teste=True)
+        consulta = {
+            "executada": True,
+            "autorizada": True,
+            "total_reportado": resposta.get("paging", {}).get("total")
+                if isinstance(resposta.get("paging"), dict) else None,
+            "observacao": "Consulta de leitura; nenhum registro criado."
+        }
+    except HTTPException as exc:
+        detalhe = exc.detail if isinstance(exc.detail, dict) else {}
+        consulta = {
+            "executada": True, "autorizada": False,
+            "status_http": exc.status_code,
+            "codigo": str(detalhe.get("code") or detalhe.get("error") or "")[:60]
+        }
+    return {
+        "ok": True,
+        "sem_cobranca": True,
+        "parametros_seguros": resumo,
+        "consulta_assinaturas": consulta,
+        "conclusao": "O erro 400 ainda nao identifica o campo rejeitado. Nenhum POST foi feito."
+    }
+
+
 @app.post("/api/assinaturas/mercadopago/teste/link")
 async def criar_link_assinatura_mercadopago_teste(
     dados: MercadoPagoLinkRequest,
