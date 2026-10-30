@@ -399,6 +399,7 @@ class ApplePayPaymentRequest(BaseModel):
 class MercadoPagoCardSubscriptionRequest(LinkAssinaturaRequest):
     email: str = Field(min_length=5, max_length=180)
     card_token_id: str = Field(min_length=10, max_length=200)
+    device_id: Optional[str] = Field(default=None, max_length=255)
 
 
 class MercadoPagoOneTimePaymentRequest(BaseModel):
@@ -411,6 +412,8 @@ class MercadoPagoOneTimePaymentRequest(BaseModel):
     issuer_id: Optional[str] = Field(default=None, max_length=50)
     identification_type: Optional[str] = Field(default=None, max_length=20)
     identification_number: Optional[str] = Field(default=None, max_length=30)
+    cardholder_name: Optional[str] = Field(default=None, max_length=120)
+    device_id: Optional[str] = Field(default=None, max_length=255)
     request_id: str = Field(min_length=8, max_length=80)
 
 
@@ -677,12 +680,21 @@ async def mercadopago_post(
     payload: dict,
     *,
     teste: bool = False,
+    extra_headers: Optional[dict] = None,
 ) -> dict:
+    headers = mercadopago_headers(teste)
+    if extra_headers:
+        headers.update({
+            str(k): str(v)
+            for k, v in extra_headers.items()
+            if v is not None and str(v).strip()
+        })
+
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{MERCADOPAGO_BASE_URL}{path}",
-                headers=mercadopago_headers(teste),
+                headers=headers,
                 json=payload,
             )
     except httpx.RequestError as exc:
@@ -1186,6 +1198,28 @@ async def criar_pagamento_mercadopago_cartao_unico(
             "number": ident_number,
         }
 
+    nome_titular = " ".join((dados.cardholder_name or "").split()).strip()
+    primeiro_nome = ""
+    sobrenome = ""
+    if nome_titular:
+        partes_nome = nome_titular.split(" ")
+        primeiro_nome = partes_nome[0]
+        sobrenome = " ".join(partes_nome[1:]) if len(partes_nome) > 1 else ""
+        payer["first_name"] = primeiro_nome
+        if sobrenome:
+            payer["last_name"] = sobrenome
+
+    additional_payer = {}
+    if primeiro_nome:
+        additional_payer["first_name"] = primeiro_nome
+    if sobrenome:
+        additional_payer["last_name"] = sobrenome
+    if ident_type and ident_number:
+        additional_payer["identification"] = {
+            "type": ident_type,
+            "number": ident_number,
+        }
+
     payload = {
         "transaction_amount": 5.00,
         "token": dados.card_token_id,
@@ -1195,6 +1229,18 @@ async def criar_pagamento_mercadopago_cartao_unico(
         "payer": payer,
         "external_reference": dados.referencia,
         "statement_descriptor": "BIKEGO",
+        "additional_info": {
+            "items": [
+                {
+                    "id": "BIKEGO-FIREBASE",
+                    "title": "Plano de armazenamento Firebase BIKEGO",
+                    "description": "Servico digital de armazenamento e infraestrutura Firebase",
+                    "quantity": 1,
+                    "unit_price": 5.00,
+                }
+            ],
+            **({"payer": additional_payer} if additional_payer else {}),
+        },
     }
 
     issuer = (dados.issuer_id or "").strip()
@@ -1203,6 +1249,9 @@ async def criar_pagamento_mercadopago_cartao_unico(
 
     headers = mercadopago_headers(False)
     headers["X-Idempotency-Key"] = dados.request_id.strip()
+    device_id = (dados.device_id or "").strip()
+    if device_id:
+        headers["X-meli-session-id"] = device_id
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -1303,10 +1352,12 @@ async def criar_assinatura_mercadopago_teste_cartao(
         "status": "authorized",
     }
 
+    device_id = (dados.device_id or "").strip()
     resposta = await mercadopago_post(
         "/preapproval",
         payload,
         teste=True,
+        extra_headers={"X-meli-session-id": device_id} if device_id else None,
     )
 
     return {
@@ -1363,7 +1414,12 @@ async def criar_assinatura_mercadopago_cartao(
         "status": "authorized",
     }
 
-    resposta = await mercadopago_post("/preapproval", payload)
+    device_id = (dados.device_id or "").strip()
+    resposta = await mercadopago_post(
+        "/preapproval",
+        payload,
+        extra_headers={"X-meli-session-id": device_id} if device_id else None,
+    )
 
     return {
         "ok": True,
