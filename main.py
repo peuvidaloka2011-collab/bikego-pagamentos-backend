@@ -604,6 +604,10 @@ def mercadopago_headers(teste: bool = False) -> dict:
         "accept": "application/json",
         "content-type": "application/json",
     }
+
+    if teste:
+        headers["X-scope"] = "stage"
+
     return headers
 
 
