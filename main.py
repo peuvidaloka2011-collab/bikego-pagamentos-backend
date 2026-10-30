@@ -355,7 +355,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.0")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -608,6 +608,24 @@ def mercadopago_headers(teste: bool = False) -> dict:
     return headers
 
 
+async def mercadopago_usuario_atual() -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                "https://api.mercadolibre.com/users/me",
+                headers={
+                    "Authorization": f"Bearer {MERCADOPAGO_ACCESS_TOKEN}",
+                    "accept": "application/json",
+                },
+            )
+        if response.status_code >= 400:
+            return {}
+        data = response.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 async def mercadopago_get(
     path: str,
     params: Optional[dict] = None,
@@ -715,7 +733,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.7.0",
+        "versao": "2.7.1",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_public_key_configurada": bool(MERCADOPAGO_PUBLIC_KEY),
@@ -1057,6 +1075,17 @@ async def criar_assinatura_mercadopago_cartao(
     email = dados.email.strip().lower()
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
+
+    vendedor = await mercadopago_usuario_atual()
+    email_vendedor = str(vendedor.get("email") or "").strip().lower()
+    if email_vendedor and email == email_vendedor:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Use o e-mail real do comprador/titular do cartão. "
+                "O e-mail do pagador não pode ser o mesmo da conta vendedora do Mercado Pago."
+            ),
+        )
 
     payload = {
         "reason": "BIKEGO - ARMAZENAMENTO FIREBASE",
