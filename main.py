@@ -355,7 +355,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.2")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -733,7 +733,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.7.2",
+        "versao": "2.7.3",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_public_key_configurada": bool(MERCADOPAGO_PUBLIC_KEY),
@@ -838,38 +838,103 @@ async def diagnostico_mercadopago_teste():
         }
 
 
+
+def _modo_credencial_mp(valor: str) -> str:
+    v = (valor or "").strip().upper()
+    if not v:
+        return "NAO_CONFIGURADA"
+    if v.startswith("TEST-"):
+        return "TESTE"
+    if v.startswith("APP_USR-"):
+        return "PRODUCAO"
+    return "DESCONHECIDO"
+
+
+def _mascarar_email(email: str) -> str:
+    e = (email or "").strip()
+    if "@" not in e:
+        return ""
+    nome, dominio = e.split("@", 1)
+    if not nome:
+        return f"***@{dominio}"
+    return f"{nome[:1]}***@{dominio}"
+
+
 @app.get("/api/mercadopago/diagnostico")
 async def diagnostico_mercadopago():
-    if not MERCADOPAGO_ACCESS_TOKEN:
-        return {
-            "ok": False,
-            "configurado": False,
-            "mensagem": "MERCADOPAGO_ACCESS_TOKEN não configurado.",
-        }
+    modo_public = _modo_credencial_mp(MERCADOPAGO_PUBLIC_KEY)
+    modo_token = _modo_credencial_mp(MERCADOPAGO_ACCESS_TOKEN)
 
-    prefixo = MERCADOPAGO_ACCESS_TOKEN[:8]
-    try:
-        resposta = await mercadopago_get(
-            "/preapproval/search",
-            params={"limit": 1},
+    vendedor = {}
+    if MERCADOPAGO_ACCESS_TOKEN:
+        vendedor = await mercadopago_usuario_atual()
+
+    mesmo_ambiente = (
+        modo_public in {"TESTE", "PRODUCAO"}
+        and modo_token in {"TESTE", "PRODUCAO"}
+        and modo_public == modo_token
+    )
+
+    assinaturas_api = "NAO_TESTADA"
+    resultados = 0
+    detalhe_assinaturas = None
+
+    if MERCADOPAGO_ACCESS_TOKEN:
+        try:
+            resposta = await mercadopago_get(
+                "/preapproval/search",
+                params={"limit": 1},
+            )
+            assinaturas_api = "AUTORIZADA"
+            resultados = len(resposta.get("results") or [])
+        except HTTPException as exc:
+            assinaturas_api = "NAO_AUTORIZADA"
+            detalhe_assinaturas = exc.detail
+
+    alertas = []
+    if modo_public == "NAO_CONFIGURADA":
+        alertas.append("MERCADOPAGO_PUBLIC_KEY não configurada.")
+    if modo_token == "NAO_CONFIGURADA":
+        alertas.append("MERCADOPAGO_ACCESS_TOKEN não configurado.")
+    if (
+        modo_public in {"TESTE", "PRODUCAO"}
+        and modo_token in {"TESTE", "PRODUCAO"}
+        and modo_public != modo_token
+    ):
+        alertas.append(
+            "Public Key e Access Token estão em ambientes diferentes."
         )
-        return {
-            "ok": True,
-            "configurado": True,
-            "token_prefixo": f"{prefixo}...",
-            "assinaturas_api": "AUTORIZADA",
-            "resultados": len(resposta.get("results") or []),
-        }
-    except HTTPException as exc:
-        detalhe = exc.detail
-        return {
-            "ok": False,
-            "configurado": True,
-            "token_prefixo": f"{prefixo}...",
-            "assinaturas_api": "NAO_AUTORIZADA",
-            "status_code": exc.status_code,
-            "detail": detalhe,
-        }
+    if MERCADOPAGO_ACCESS_TOKEN and not vendedor:
+        alertas.append(
+            "O Access Token não conseguiu identificar a conta vendedora."
+        )
+    if assinaturas_api != "AUTORIZADA":
+        alertas.append(
+            "A API de assinaturas não está autorizada com o Access Token atual."
+        )
+
+    return {
+        "ok": True,
+        "publicKeyConfigurada": bool(MERCADOPAGO_PUBLIC_KEY),
+        "accessTokenConfigurado": bool(MERCADOPAGO_ACCESS_TOKEN),
+        "ambientePublicKey": modo_public,
+        "ambienteAccessToken": modo_token,
+        "mesmoAmbiente": mesmo_ambiente,
+        "assinaturasApi": assinaturas_api,
+        "resultados": resultados,
+        "vendedorReconhecido": bool(vendedor),
+        "vendedorId": vendedor.get("id") if vendedor else None,
+        "vendedorEmailMascarado": _mascarar_email(
+            str(vendedor.get("email") or "")
+        ) if vendedor else None,
+        "alertas": alertas,
+        "detail": detalhe_assinaturas,
+        "observacao": (
+            "Nenhuma credencial secreta é exibida. "
+            "Se Public Key e Access Token estiverem em PRODUCAO, "
+            "ainda confirme no painel Mercado Pago que pertencem à mesma aplicação."
+        ),
+    }
 
 
 @app.post("/api/assinaturas/mercadopago/teste/link")
