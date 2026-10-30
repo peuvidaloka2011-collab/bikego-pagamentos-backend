@@ -853,14 +853,46 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
             detail="Asaas não retornou o identificador do novo Checkout.",
         )
 
-    link = str(resposta.get("link") or "").strip()
+    # O Asaas alterou gradualmente a estrutura das URLs públicas em 2026.
+    # Sempre prefira a URL completa devolvida pela API quando disponível.
+    link = ""
+    if isinstance(resposta, dict):
+        for chave in (
+            "link",
+            "url",
+            "checkoutUrl",
+            "checkoutURL",
+            "paymentUrl",
+            "publicUrl",
+        ):
+            valor_url = resposta.get(chave)
+            if isinstance(valor_url, str) and valor_url.strip().startswith("http"):
+                link = valor_url.strip()
+                break
+
+        if not link:
+            links = resposta.get("links") or resposta.get("_links") or []
+            if isinstance(links, dict):
+                links = list(links.values())
+            if isinstance(links, list):
+                for item in links:
+                    if isinstance(item, str) and item.startswith("http"):
+                        link = item
+                        break
+                    if isinstance(item, dict):
+                        href = str(item.get("href") or item.get("url") or "").strip()
+                        if href.startswith("http"):
+                            link = href
+                            break
+
+    # Fallback mantido conforme a documentação atual do Asaas Checkout.
     if not link:
-        base_checkout = (
-            "https://asaas.com/checkoutSession/show"
+        host_checkout = (
+            "https://asaas.com"
             if ASAAS_ENV == "production"
-            else "https://sandbox.asaas.com/checkoutSession/show"
+            else "https://sandbox.asaas.com"
         )
-        link = f"{base_checkout}?id={checkout_id}"
+        link = f"{host_checkout}/checkoutSession/show?id={checkout_id}"
 
     # Mantém a relação entre o Checkout do Asaas e o cliente do BIKEGO.
     # Isso permite tratar CHECKOUT_PAID mesmo se o webhook não repetir
