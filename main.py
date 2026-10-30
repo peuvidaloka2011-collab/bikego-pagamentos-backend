@@ -358,35 +358,6 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-def _checkout_por_referencia(referencia: str) -> tuple[object, dict]:
-    """Preço e comprador são obtidos exclusivamente do cadastro no Firestore.
-
-    Nunca aceitar dados financeiros originados de parâmetros de URL ou do navegador.
-    """
-    if not referencia or len(referencia) > 200:
-        raise HTTPException(status_code=400, detail="Referência inválida.")
-    docs = list(
-        get_firestore_db().collection("clientes")
-        .where("referenciaAssinatura", "==", referencia)
-        .limit(2).stream()
-    )
-    if len(docs) != 1:
-        raise HTTPException(status_code=404, detail="Cobrança não encontrada.")
-    documento = docs[0]
-    dados = documento.to_dict() or {}
-    if not str(dados.get("provedorPagamento") or "").upper().startswith("MERCADO_PAGO"):
-        raise HTTPException(status_code=409, detail="Cobrança não pertence ao Mercado Pago.")
-    valor = dados.get("valor")
-    try:
-        centavos = round(float(valor) * 100)
-    except (TypeError, ValueError, OverflowError):
-        raise HTTPException(status_code=409, detail="Valor da cobrança inválido.")
-    if not 1 <= centavos <= 100000000:
-        raise HTTPException(status_code=409, detail="Valor da cobrança inválido.")
-    dados["valor"] = centavos / 100
-    return documento, dados
-
-
 app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.7.4")
 
 app.add_middleware(
@@ -801,17 +772,6 @@ def raiz():
     }
 
 
-@app.get("/api/mercadopago/checkout/{referencia}")
-def consultar_checkout_mercadopago(referencia: str):
-    _, dados = _checkout_por_referencia(referencia)
-    return {
-        "ok": True,
-        "empresa": str(dados.get("empresa") or "Cliente BIKEGO"),
-        "valor": dados["valor"],
-        "moeda": "BRL",
-    }
-
-
 @app.get("/health")
 def health():
     return {
@@ -820,6 +780,7 @@ def health():
         "webhook_token_configurado": bool(ASAAS_WEBHOOK_TOKEN),
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "mercadopago_teste_configurado": bool(MERCADOPAGO_TEST_ACCESS_TOKEN),
+        "mercadopago_teste_public_key_configurada": bool(MERCADOPAGO_TEST_PUBLIC_KEY),
         "mercadopago_webhook_configurado": bool(MERCADOPAGO_WEBHOOK_SECRET),
         "pagbank_configurado": bool(PAGBANK_TOKEN),
         "pagbank_ambiente": PAGBANK_ENV,
@@ -833,7 +794,6 @@ def health():
 
 @app.post("/api/assinaturas/link")
 async def criar_link_assinatura(dados: LinkAssinaturaRequest):
-    raise HTTPException(status_code=410, detail="Novas assinaturas somente pelo Mercado Pago.")
     """
     Cria o novo Asaas Checkout hospedado para assinatura mensal no cartão.
     O cliente digita os dados do cartão diretamente no Asaas.
@@ -854,7 +814,7 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
         },
         "items": [
             {
-                "name": "BIKEGO FIREBASE",
+                "name": "BIKEGO - ARMAZENAMENTO FIREBASE",
                 "description": dados.descricao,
                 "quantity": 1,
                 "value": round(dados.valor, 2),
@@ -894,46 +854,14 @@ async def criar_link_assinatura(dados: LinkAssinaturaRequest):
             detail="Asaas não retornou o identificador do novo Checkout.",
         )
 
-    # O Asaas alterou gradualmente a estrutura das URLs públicas em 2026.
-    # Sempre prefira a URL completa devolvida pela API quando disponível.
-    link = ""
-    if isinstance(resposta, dict):
-        for chave in (
-            "link",
-            "url",
-            "checkoutUrl",
-            "checkoutURL",
-            "paymentUrl",
-            "publicUrl",
-        ):
-            valor_url = resposta.get(chave)
-            if isinstance(valor_url, str) and valor_url.strip().startswith("http"):
-                link = valor_url.strip()
-                break
-
-        if not link:
-            links = resposta.get("links") or resposta.get("_links") or []
-            if isinstance(links, dict):
-                links = list(links.values())
-            if isinstance(links, list):
-                for item in links:
-                    if isinstance(item, str) and item.startswith("http"):
-                        link = item
-                        break
-                    if isinstance(item, dict):
-                        href = str(item.get("href") or item.get("url") or "").strip()
-                        if href.startswith("http"):
-                            link = href
-                            break
-
-    # Fallback mantido conforme a documentação atual do Asaas Checkout.
+    link = str(resposta.get("link") or "").strip()
     if not link:
-        host_checkout = (
-            "https://asaas.com"
+        base_checkout = (
+            "https://asaas.com/checkoutSession/show"
             if ASAAS_ENV == "production"
-            else "https://sandbox.asaas.com"
+            else "https://sandbox.asaas.com/checkoutSession/show"
         )
-        link = f"{host_checkout}/checkoutSession/show?id={checkout_id}"
+        link = f"{base_checkout}?id={checkout_id}"
 
     # Mantém a relação entre o Checkout do Asaas e o cliente do BIKEGO.
     # Isso permite tratar CHECKOUT_PAID mesmo se o webhook não repetir
@@ -978,13 +906,11 @@ async def diagnostico_mercadopago_teste():
             "mensagem": "MERCADOPAGO_TEST_ACCESS_TOKEN não configurado.",
         }
 
-    prefixo = MERCADOPAGO_TEST_ACCESS_TOKEN[:8]
     try:
         resposta = await mercadopago_get("/preapproval/search", params={"limit": 1}, teste=True)
         return {
             "ok": True,
             "configurado": True,
-            "token_prefixo": f"{prefixo}...",
             "assinaturas_api": "AUTORIZADA",
             "ambiente": "TESTE",
             "resultados": len(resposta.get("results") or []),
@@ -993,7 +919,6 @@ async def diagnostico_mercadopago_teste():
         return {
             "ok": False,
             "configurado": True,
-            "token_prefixo": f"{prefixo}...",
             "assinaturas_api": "NAO_AUTORIZADA",
             "ambiente": "TESTE",
             "status_code": exc.status_code,
@@ -1520,16 +1445,9 @@ async def criar_assinatura_mercadopago_cartao(
     pelo Card Payment Brick no navegador do cliente.
     O backend nunca recebe número completo do cartão nem CVV.
     """
-    documento, cadastro = _checkout_por_referencia(dados.referencia or "")
     email = dados.email.strip().lower()
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
-    if email != str(cadastro.get("emailPagamento") or "").strip().lower():
-        raise HTTPException(status_code=409, detail="E-mail diferente do cadastro da cobrança.")
-    if round(dados.valor * 100) != round(cadastro["valor"] * 100):
-        raise HTTPException(status_code=409, detail="O valor da cobrança foi alterado. Gere um novo link.")
-    if cadastro.get("mercadoPagoSubscriptionId"):
-        raise HTTPException(status_code=409, detail="Já existe uma assinatura para esta cobrança.")
 
     vendedor = await mercadopago_usuario_atual()
     email_vendedor = str(vendedor.get("email") or "").strip().lower()
@@ -1550,7 +1468,7 @@ async def criar_assinatura_mercadopago_cartao(
         "auto_recurring": {
             "frequency": 1,
             "frequency_type": "months",
-            "transaction_amount": cadastro["valor"],
+            "transaction_amount": round(dados.valor, 2),
             "currency_id": "BRL",
         },
         "back_url": MERCADOPAGO_BACK_URL,
@@ -1563,13 +1481,6 @@ async def criar_assinatura_mercadopago_cartao(
         payload,
         extra_headers={"X-meli-session-id": device_id} if device_id else None,
     )
-
-    if resposta.get("id"):
-        documento.reference.set(
-            {"mercadoPagoSubscriptionId": str(resposta["id"]),
-             "atualizadoEm": firestore.SERVER_TIMESTAMP},
-            merge=True,
-        )
 
     return {
         "ok": True,
@@ -1587,16 +1498,9 @@ async def criar_assinatura_mercadopago_cartao(
 
 @app.post("/api/assinaturas/mercadopago/link")
 async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
-    documento, cadastro = _checkout_por_referencia(dados.referencia or "")
     email = dados.email.strip().lower()
     if "@" not in email:
         raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
-    if email != str(cadastro.get("emailPagamento") or "").strip().lower():
-        raise HTTPException(status_code=409, detail="E-mail diferente do cadastro da cobrança.")
-    if round(dados.valor * 100) != round(cadastro["valor"] * 100):
-        raise HTTPException(status_code=409, detail="Valor diferente do cadastro.")
-    if cadastro.get("mercadoPagoSubscriptionId"):
-        raise HTTPException(status_code=409, detail="Já existe uma assinatura para esta cobrança.")
 
     payload = {
         "reason": "BIKEGO - ARMAZENAMENTO FIREBASE",
@@ -1605,7 +1509,7 @@ async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
         "auto_recurring": {
             "frequency": 1,
             "frequency_type": "months",
-            "transaction_amount": cadastro["valor"],
+            "transaction_amount": round(dados.valor, 2),
             "currency_id": "BRL",
         },
         "back_url": MERCADOPAGO_BACK_URL,
@@ -1614,12 +1518,6 @@ async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
     }
 
     resposta = await mercadopago_post("/preapproval", payload)
-    if resposta.get("id"):
-        documento.reference.set(
-            {"mercadoPagoSubscriptionId": str(resposta["id"]),
-             "atualizadoEm": firestore.SERVER_TIMESTAMP},
-            merge=True,
-        )
     link = resposta.get("init_point")
     if not link:
         raise HTTPException(
@@ -1641,7 +1539,6 @@ async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
 
 @app.post("/api/pagamentos/pagbank/debito/link")
 async def criar_link_pagamento_debito_pagbank(dados: MercadoPagoLinkRequest):
-    raise HTTPException(status_code=410, detail="Pagamento por débito desativado.")
     """
     Gera checkout PagBank aceitando somente cartão de débito.
     O método DEBIT_CARD depende de liberação/homologação da conta PagBank.
@@ -1771,7 +1668,6 @@ async def status_pagamento_debito_pagbank(referencia: str):
 
 @app.post("/api/pagamentos/mercadopago/debito/link")
 async def criar_link_pagamento_debito_mercadopago(dados: MercadoPagoLinkRequest):
-    raise HTTPException(status_code=410, detail="Pagamento por débito desativado.")
     """
     Gera uma cobrança mensal avulsa no Checkout Pro, priorizando cartão de débito.
     Diferente do cartão de crédito recorrente, esta cobrança não cria assinatura:
@@ -2149,6 +2045,20 @@ async def webhook_mercadopago(request: Request):
             "type": tipo,
             "firebaseUpdated": 0,
             "warning": "Evento Mercado Pago sem external_reference.",
+        }
+
+    # SEGURANCA: eventos de teste nunca alteram contratos/clientes reais.
+    # Retornamos a confirmacao ao Mercado Pago para evitar reentregas,
+    # mas registramos o estado apenas na resposta (sem escrita no Firebase).
+    if ambiente_teste:
+        return {
+            "received": True,
+            "ambiente": "TESTE",
+            "type": tipo,
+            "externalReference": referencia,
+            "firebaseUpdated": 0,
+            "statusSimulado": novo_status,
+            "aviso": "Evento de teste processado sem modificar cliente de producao.",
         }
 
     atualizados = _sincronizar_cliente_firebase(
