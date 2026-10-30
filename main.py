@@ -340,7 +340,7 @@ def _sincronizar_cliente_firebase(
     return atualizados
 
 
-app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.3.0")
+app = FastAPI(title="BIKEGO Pagamentos Backend", version="2.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -537,7 +537,7 @@ def raiz():
     return {
         "app": "BIKEGO Pagamentos Backend",
         "status": "online",
-        "versao": "2.3.0",
+        "versao": "2.4.0",
         "ambiente_asaas": ASAAS_ENV,
         "mercadopago_configurado": bool(MERCADOPAGO_ACCESS_TOKEN),
         "firebase_configurado": _firebase_configurado(),
@@ -757,6 +757,113 @@ async def criar_link_assinatura_mercadopago(dados: MercadoPagoLinkRequest):
         "subscriptionId": resposta.get("id"),
         "url": link,
         "mercadopago": resposta,
+    }
+
+
+@app.post("/api/pagamentos/mercadopago/debito/link")
+async def criar_link_pagamento_debito_mercadopago(dados: MercadoPagoLinkRequest):
+    """
+    Gera uma cobrança mensal avulsa no Checkout Pro, priorizando cartão de débito.
+    Diferente do cartão de crédito recorrente, esta cobrança não cria assinatura:
+    a cada novo mês é necessário gerar uma nova cobrança.
+    """
+    email = dados.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="Informe um e-mail válido do pagador.")
+
+    payload = {
+        "items": [
+            {
+                "id": "bikego_mensalidade",
+                "title": "BIKEGO - ARMAZENAMENTO FIREBASE",
+                "description": dados.descricao,
+                "quantity": 1,
+                "currency_id": "BRL",
+                "unit_price": round(dados.valor, 2),
+            }
+        ],
+        "payer": {"email": email},
+        "external_reference": dados.referencia,
+        "back_urls": {
+            "success": MERCADOPAGO_BACK_URL,
+            "pending": MERCADOPAGO_BACK_URL,
+            "failure": MERCADOPAGO_BACK_URL,
+        },
+        "auto_return": "approved",
+        "notification_url": MERCADOPAGO_NOTIFICATION_URL,
+        "payment_methods": {
+            "excluded_payment_types": [
+                {"id": "credit_card"},
+                {"id": "ticket"},
+                {"id": "bank_transfer"},
+                {"id": "prepaid_card"},
+            ],
+            "installments": 1,
+        },
+        "statement_descriptor": "BIKEGO",
+    }
+
+    resposta = await mercadopago_post("/checkout/preferences", payload)
+    link = resposta.get("init_point")
+    if not link:
+        raise HTTPException(
+            status_code=502,
+            detail="Mercado Pago não retornou o link para pagamento no débito.",
+        )
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO",
+        "metodo": "DEBITO",
+        "empresa": dados.empresa,
+        "valor": dados.valor,
+        "referencia": dados.referencia,
+        "preferenceId": resposta.get("id"),
+        "url": link,
+        "mercadopago": resposta,
+    }
+
+
+@app.get("/api/pagamentos/mercadopago/debito/status/{referencia}")
+async def status_pagamento_debito_mercadopago(referencia: str):
+    busca = await mercadopago_get(
+        "/v1/payments/search",
+        params={
+            "external_reference": referencia,
+            "sort": "date_created",
+            "criteria": "desc",
+            "limit": 20,
+        },
+    )
+    resultados = busca.get("results") or []
+
+    if not resultados:
+        return {
+            "ok": True,
+            "provedor": "MERCADO_PAGO",
+            "metodo": "DEBITO",
+            "referencia": referencia,
+            "status": "AGUARDANDO_PAGAMENTO",
+            "pago": False,
+        }
+
+    aprovado = next(
+        (p for p in resultados if str(p.get("status") or "").lower() == "approved"),
+        None,
+    )
+    ultimo = aprovado or resultados[0]
+    status_mp = str(ultimo.get("status") or "").lower()
+
+    return {
+        "ok": True,
+        "provedor": "MERCADO_PAGO",
+        "metodo": "DEBITO",
+        "referencia": referencia,
+        "status": "ATIVO" if aprovado else "AGUARDANDO_PAGAMENTO",
+        "pago": bool(aprovado),
+        "paymentId": ultimo.get("id"),
+        "paymentStatus": status_mp,
+        "valor": ultimo.get("transaction_amount"),
     }
 
 
