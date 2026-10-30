@@ -1209,16 +1209,16 @@ async def criar_pagamento_mercadopago_cartao_unico(
         if sobrenome:
             payer["last_name"] = sobrenome
 
+    # Dados adicionais para o motor de risco.
+    # O CPF/documento já é enviado em payer.identification no nível principal.
+    # Não duplicamos identification dentro de additional_info.payer porque
+    # algumas contas/versões da Payments API rejeitam esse caminho.
     additional_payer = {}
     if primeiro_nome:
         additional_payer["first_name"] = primeiro_nome
     if sobrenome:
         additional_payer["last_name"] = sobrenome
-    if ident_type and ident_number:
-        additional_payer["identification"] = {
-            "type": ident_type,
-            "number": ident_number,
-        }
+    additional_payer["authentication_type"] = "WEB"
 
     payload = {
         "transaction_amount": 5.00,
@@ -1235,6 +1235,7 @@ async def criar_pagamento_mercadopago_cartao_unico(
                     "id": "BIKEGO-FIREBASE",
                     "title": "Plano de armazenamento Firebase BIKEGO",
                     "description": "Servico digital de armazenamento e infraestrutura Firebase",
+                    "category_id": "digital_goods",
                     "quantity": 1,
                     "unit_price": 5.00,
                 }
