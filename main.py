@@ -1478,7 +1478,8 @@ async def _v56_link_checkout_existente(snap, fatura_ref, cliente_ref,
         raise HTTPException(409, "Fatura com situacao nao conciliada. Consulte pagamentos antes de migrar o checkout.")
     if dados.get("provedor") != "MERCADO_PAGO_AVULSO":
         raise HTTPException(409, "Tipo de fatura incompativel com o checkout sem conta.")
-    if dados.get("brickPaymentId") or dados.get("brickLockIncerteza"):
+    if (dados.get("brickPaymentId") or dados.get("brickLockIncerteza")
+            or dados.get("brickLockUntil")):
         raise HTTPException(409, "Existe pagamento anterior ou tentativa incerta. Concilie antes de trocar o link.")
     atual = str(dados.get("guestCheckoutUrl") or "")
     if atual and dados.get("guestAccessHash"):
@@ -1519,6 +1520,58 @@ async def _v56_link_checkout_existente(snap, fatura_ref, cliente_ref,
     cliente_ref.set({"linkAssinatura": destino,
                     "atualizadoEm": firestore.SERVER_TIMESTAMP}, merge=True)
     return destino
+
+
+# V58: botao ABRIR LINK busca a URL diretamente na fatura do Firebase.
+# Reaproveita a preferencia antiga, preserva faturas pagas e nunca emite cobranca.
+# Requer ID Token do administrador, e nao publica os segredos do link.
+@app.post("/api/v58/faturas/mercadopago/resolver-link")
+async def v58_resolver_link_fatura(
+    dados: V52NovaFaturaRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    _v52_admin(authorization)
+    _v52_operacional()
+    if not BIKEGO_MP_GUEST_BRICK_ENABLED:
+        raise HTTPException(
+            503,
+            "Ative BIKEGO_MP_GUEST_BRICK_ENABLED=true no Render antes de abrir o checkout BIKEGO.",
+        )
+    db = get_firestore_db()
+    cliente_ref = db.collection("clientes").document(dados.cliente_id)
+    cliente_snap = cliente_ref.get()
+    if not cliente_snap.exists:
+        raise HTTPException(404, "Cliente nao encontrado.")
+    cliente = cliente_snap.to_dict() or {}
+    if str(cliente.get("provedorPagamento") or "").upper() != "MERCADO_PAGO_AVULSO":
+        raise HTTPException(409, "Cliente sem fatura unica do Mercado Pago.")
+    referencia = str(cliente.get("referenciaAssinatura") or "")
+    if not re.fullmatch(r"BIKEGO-FAT-[0-9A-F]{20}-\d{6}", referencia):
+        raise HTTPException(409, "Cliente sem referencia de fatura V52 valida.")
+    fatura_ref = db.collection("faturas_mp").document(referencia)
+    fatura_snap = fatura_ref.get()
+    if not fatura_snap.exists:
+        raise HTTPException(404, "Fatura nao encontrada.")
+    fatura = fatura_snap.to_dict() or {}
+    if str(fatura.get("clienteId") or "") != dados.cliente_id:
+        raise HTTPException(409, "Referencia nao pertence ao cliente solicitado.")
+    if fatura.get("status") == "PAGO":
+        return {"ok": True, "ja_paga": True, "referencia": referencia,
+                "status": "PAGO", "url": None,
+                "mensagem": "Fatura ja paga; nao gere outro pagamento."}
+    if fatura.get("status") != "PENDENTE":
+        raise HTTPException(409, "Fatura nao esta pendente. Concilie a situacao antes de abrir o pagamento.")
+    if not str(fatura.get("checkoutUrl") or "").startswith("https://"):
+        raise HTTPException(409, "Preferencia original ausente. Nao criar uma nova fatura automaticamente.")
+    url = await _v56_link_checkout_existente(
+        fatura_snap, fatura_ref, cliente_ref,
+        referencia, str(fatura.get("checkoutUrl") or "")
+    )
+    if not url.startswith("https://bikego-pagamentos-web.web.app/pagar_fatura.html?"):
+        raise HTTPException(503, "Endereco do checkout BIKEGO invalido.")
+    return {"ok": True, "referencia": referencia, "status": "PENDENTE",
+            "reutilizada": True, "url": url,
+            "aviso": "Mesma fatura: nao foi criada outra preferencia ou cobranca."}
 
 
 @app.post("/api/v52/faturas/mercadopago/gerar")
