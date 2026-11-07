@@ -1769,6 +1769,81 @@ async def v58_resolver_link_fatura(
             "aviso": "Mesma fatura: nao foi criada outra preferencia ou cobranca."}
 
 
+def _v63_assinatura_antiga_cancelada(dados: dict, referencia: str) -> bool:
+    """Somente a assinatura exata e definitivamente cancelada permite migrar.
+
+    Status 'paused' nao e suficiente: uma assinatura pausada pode ser retomada.
+    """
+    return (
+        isinstance(dados, dict)
+        and str(dados.get("id") or "").strip() == referencia
+        and str(dados.get("status") or "").strip().lower() in {"cancelled", "canceled"}
+    )
+
+
+async def _v63_migrar_referencia_antiga_cancelada(cliente_ref, cliente_snap, referencia: str):
+    """V63: desvincula referencia legada APENAS apos validar cancelamento no MP.
+
+    A exclusao de uma cobranca no painel/Firestore nao cancela uma assinatura
+    recorrente no provedor. Nunca criar outra cobranca por mera ausencia do
+    documento local, nem tratar 404/erro da API como assinatura cancelada.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", referencia):
+        raise HTTPException(
+            409,
+            "Referencia antiga em formato desconhecido. Confirme o cancelamento "
+            "no provedor e solicite a migracao administrativa antes de gerar outra fatura.",
+        )
+
+    try:
+        assinatura = await mercadopago_get(f"/preapproval/{referencia}")
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(
+                409,
+                "Referencia antiga nao localizada no Mercado Pago. Isso NAO comprova "
+                "cancelamento. Verifique a assinatura no provedor antes de migrar.",
+            ) from exc
+        raise HTTPException(
+            503,
+            "Nao foi possivel confirmar o status da assinatura antiga no Mercado Pago. "
+            "Nenhuma nova fatura foi criada. Tente novamente mais tarde.",
+        ) from exc
+
+    if not _v63_assinatura_antiga_cancelada(assinatura, referencia):
+        status = str(assinatura.get("status") or "desconhecido").strip().lower()
+        raise HTTPException(
+            409,
+            "A assinatura anterior ainda nao foi confirmada como cancelada "
+            f"(status no Mercado Pago: {status}). Cancele-a no provedor antes "
+            "de gerar uma fatura avulsa, para evitar cobrancas duplicadas.",
+        )
+
+    # Preserva a referencia original e o status verificado para auditoria.
+    # Atualizacao com precondicao evita sobrescrever uma alteracao concorrente.
+    try:
+        option = get_firestore_db().write_option(
+            last_update_time=cliente_snap.update_time
+        )
+        cliente_ref.update({
+            "referenciaAssinatura": firestore.DELETE_FIELD,
+            "linkAssinatura": firestore.DELETE_FIELD,
+            "ultimaMigracaoCobranca": {
+                "referenciaAnterior": referencia,
+                "provedor": "MERCADO_PAGO",
+                "statusConfirmado": "CANCELADA",
+            },
+            "ultimaMigracaoCobrancaEm": firestore.SERVER_TIMESTAMP,
+            "atualizadoEm": firestore.SERVER_TIMESTAMP,
+        }, option=option)
+    except Exception as exc:
+        raise HTTPException(
+            409,
+            "O cadastro do cliente mudou durante a verificacao. Reabra o cliente "
+            "e tente gerar a fatura novamente.",
+        ) from exc
+
+
 @app.post("/api/v52/faturas/mercadopago/gerar")
 async def v52_gerar_fatura(dados: V52NovaFaturaRequest, authorization: Optional[str] = Header(default=None)):
     _v52_admin(authorization)
@@ -1785,8 +1860,6 @@ async def v52_gerar_fatura(dados: V52NovaFaturaRequest, authorization: Optional[
     if not prov.startswith("MERCADO_PAGO"):
         raise HTTPException(409, "Cliente nao esta configurado para Mercado Pago.")
     ref_anterior = str(cliente.get("referenciaAssinatura") or "").strip()
-    if ref_anterior and not ref_anterior.startswith("BIKEGO-FAT-"):
-        raise HTTPException(409, "Cliente possui referencia de cobranca antiga. Verifique/cancele a assinatura anterior e conclua a migracao antes de emitir fatura unica.")
     if not cliente.get("aplicativosContratados") and not cliente.get("app"):
         raise HTTPException(400, "Cadastre ao menos um aplicativo no cliente.")
     try:
@@ -1798,6 +1871,10 @@ async def v52_gerar_fatura(dados: V52NovaFaturaRequest, authorization: Optional[
     email = str(cliente.get("emailPagamento") or "").strip().lower()
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise HTTPException(400, "Cadastre um e-mail valido no cliente.")
+    if ref_anterior and not ref_anterior.startswith("BIKEGO-FAT-"):
+        await _v63_migrar_referencia_antiga_cancelada(
+            cliente_ref, cliente_snap, ref_anterior
+        )
     vencimento = _v52_data(cliente.get("vencimento")) or _v52_agora().date()
     # A fatura corresponde ao mes da data de vencimento cadastrada.
     periodo = vencimento.strftime("%Y%m")
