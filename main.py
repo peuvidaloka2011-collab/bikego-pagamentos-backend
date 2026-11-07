@@ -1495,8 +1495,15 @@ async def v62_liberacao_manual(
         raise HTTPException(422, "Identificador de cliente invalido.")
 
     codigo = dados.codigo_aplicativo.strip().lower()
-    if not re.fullmatch(r"vendas_[a-z0-9_]+", codigo):
-        raise HTTPException(422, "Liberacao manual disponivel somente para BIKEGO VENDAS por unidade.")
+    # Apenas aplicativos explicitamente reconhecidos e contratados podem
+    # receber uma concessao manual. Nao aceitar slugs arbitrarios do cliente.
+    codigos_permitidos = {
+        "vendas_hub_global", "vendas_bruno_covas",
+        "vendas_ciclo_pinheiros", "vendas_villa_lobos",
+        "estoque", "resgate", "triciclo_familia", "avaliacao", "bicicleta",
+    }
+    if codigo not in codigos_permitidos:
+        raise HTTPException(422, "Aplicativo nao habilitado para liberacao manual.")
 
     db = get_firestore_db()
     ref_cliente = db.collection("clientes").document(dados.cliente_id)
