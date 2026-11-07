@@ -131,6 +131,19 @@ def _data_br(valor: Optional[str]) -> str:
 
 def _codigo_aplicativo(nome: str) -> str:
     n = (nome or "").upper()
+    # Mesmo codigo usado pelo painel Flutter e pelo BIKEGO VENDAS Windows.
+    # Antes o backend gerava "bikego_vendas_bruno_covas" como codigo e
+    # escrevia em outro documento, sem desbloquear a licenca consultada.
+    if "VENDAS" in n:
+        if "HUB" in n:
+            return "vendas_hub_global"
+        if "BRUNO" in n:
+            return "vendas_bruno_covas"
+        if "CICLO" in n:
+            return "vendas_ciclo_pinheiros"
+        if "VILLA" in n or "VILA" in n:
+            return "vendas_villa_lobos"
+        return "vendas"
     if "ESTOQUE" in n:
         return "estoque"
     if "RESGATE" in n:
@@ -148,9 +161,49 @@ def _codigo_aplicativo(nome: str) -> str:
 
 def _id_licenca(cliente_id: str, empresa: str, aplicativo: str) -> str:
     codigo = _codigo_aplicativo(aplicativo)
-    if (empresa or "").strip().upper() == "BIKEGO" and codigo == "estoque":
-        return "bikego_estoque"
+    if (empresa or "").strip().upper() == "BIKEGO":
+        if codigo == "estoque":
+            return "bikego_estoque"
+        if codigo.startswith("vendas_"):
+            return f"bikego_{codigo}"
     return f"{cliente_id}_{codigo}"
+
+
+def _licenca_efetiva(dados: dict, licenca_id: str, status_financeiro: str,
+                     vencimento_financeiro: str) -> dict:
+    """Calcula acesso sem alterar o estado financeiro da fatura.
+
+    Uma liberacao administrativa vale somente para a licenca identificada,
+    ate sua data final (inclusive), sem tolerancia extra.
+    """
+    grants = dados.get("liberacoesManuais") or {}
+    grant = grants.get(licenca_id) if isinstance(grants, dict) else None
+    ate = str((grant or {}).get("ate") or "") if isinstance(grant, dict) else ""
+    try:
+        ate_data = date.fromisoformat(ate)
+    except ValueError:
+        ate_data = None
+    manual_ativo = (status_financeiro != "ATIVO" and ate_data is not None
+                    and ate_data >= datetime.now(ZoneInfo("America/Sao_Paulo")).date())
+    if manual_ativo:
+        return {
+            "status": "ATIVO",
+            "liberado": True,
+            "vencimento": ate_data.strftime("%d/%m/%Y"),
+            "diasTolerancia": 0,
+            "mensagem": f"Acesso liberado administrativamente ate {ate_data.strftime('%d/%m/%Y')}.",
+            "origemLiberacao": "ADMIN_MANUAL",
+            "liberacaoManualAte": ate,
+        }
+    return {
+        "status": status_financeiro,
+        "liberado": status_financeiro == "ATIVO",
+        "vencimento": vencimento_financeiro,
+        "diasTolerancia": 2,
+        "mensagem": _mensagem_status(status_financeiro),
+        "origemLiberacao": "FINANCEIRO",
+        "liberacaoManualAte": "",
+    }
 
 
 async def _contexto_pagamento_asaas(payment: dict) -> tuple[Optional[str], dict, dict]:
@@ -289,6 +342,7 @@ def _sincronizar_cliente_firebase(
         for aplicativo in [str(a) for a in apps if str(a).strip()]:
             licenca_id = _id_licenca(doc.id, empresa, aplicativo)
             codigo = _codigo_aplicativo(aplicativo).upper()
+            acesso = _licenca_efetiva(dados, licenca_id, status, vencimento_final)
 
             batch.set(
                 db.collection("licencas").document(licenca_id),
@@ -299,10 +353,13 @@ def _sincronizar_cliente_firebase(
                     "aplicativoNome": aplicativo,
                     "plano": plano,
                     "valor": valor,
-                    "vencimento": vencimento_final,
-                    "status": status,
-                    "liberado": liberado,
-                    "mensagem": mensagem,
+                    "vencimento": acesso["vencimento"],
+                    "status": acesso["status"],
+                    "statusFinanceiro": status,
+                    "liberado": acesso["liberado"],
+                    "mensagem": acesso["mensagem"],
+                    "origemLiberacao": acesso["origemLiberacao"],
+                    "liberacaoManualAte": acesso["liberacaoManualAte"],
                     "linkPagamento": link,
                     "asaasPaymentId": payment_id or referencia,
                     "atualizadoEm": firestore.SERVER_TIMESTAMP,
@@ -315,11 +372,14 @@ def _sincronizar_cliente_firebase(
                 {
                     "clienteId": doc.id,
                     "aplicativo": codigo,
-                    "vencimento": vencimento_final,
-                    "status": status,
-                    "liberado": liberado,
-                    "diasTolerancia": 2,
-                    "mensagem": mensagem,
+                    "vencimento": acesso["vencimento"],
+                    "status": acesso["status"],
+                    "statusFinanceiro": status,
+                    "liberado": acesso["liberado"],
+                    "diasTolerancia": acesso["diasTolerancia"],
+                    "mensagem": acesso["mensagem"],
+                    "origemLiberacao": acesso["origemLiberacao"],
+                    "liberacaoManualAte": acesso["liberacaoManualAte"],
                     "linkPagamento": link,
                     "atualizadoEm": firestore.SERVER_TIMESTAMP,
                 },
@@ -1406,6 +1466,134 @@ def _v52_admin(authorization):
     return decoded
 
 
+class V62LiberacaoManualRequest(BaseModel):
+    cliente_id: str = Field(min_length=4, max_length=200)
+    codigo_aplicativo: str = Field(min_length=3, max_length=80)
+    acao: str = Field(default="LIBERAR", max_length=12)
+    dias: int = Field(default=7, ge=1, le=30)
+    motivo: str = Field(default="", max_length=240)
+
+
+@app.post("/api/v62/licencas/liberacao-manual")
+async def v62_liberacao_manual(
+    dados: V62LiberacaoManualRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Concede/revoga acesso temporario sem declarar uma fatura paga.
+
+    Exclusivo ao UID administrador validado pelo Firebase. A alteracao e
+    registrada em auditoria e limitada ao aplicativo contratado solicitado.
+    """
+    admin = _v52_admin(authorization)
+    acao = dados.acao.strip().upper()
+    if acao not in ("LIBERAR", "REVOGAR"):
+        raise HTTPException(422, "Acao deve ser LIBERAR ou REVOGAR.")
+    motivo = dados.motivo.strip()
+    if len(motivo) < 10:
+        raise HTTPException(422, "Informe o motivo administrativo (minimo 10 caracteres).")
+    if "/" in dados.cliente_id or dados.cliente_id in (".", ".."):
+        raise HTTPException(422, "Identificador de cliente invalido.")
+
+    codigo = dados.codigo_aplicativo.strip().lower()
+    if not re.fullmatch(r"vendas_[a-z0-9_]+", codigo):
+        raise HTTPException(422, "Liberacao manual disponivel somente para BIKEGO VENDAS por unidade.")
+
+    db = get_firestore_db()
+    ref_cliente = db.collection("clientes").document(dados.cliente_id)
+    snap = ref_cliente.get()
+    if not snap.exists:
+        raise HTTPException(404, "Cliente nao encontrado no Firestore.")
+    cliente = snap.to_dict() or {}
+    empresa = str(cliente.get("empresa") or "")
+    apps = cliente.get("aplicativosContratados") or [cliente.get("app")]
+    if not isinstance(apps, list):
+        apps = [cliente.get("app")]
+    encontrados = [str(app) for app in apps if _codigo_aplicativo(str(app)) == codigo]
+    if len(encontrados) != 1:
+        raise HTTPException(409, "Aplicativo nao vinculado de modo unico a este cliente.")
+    aplicativo = encontrados[0]
+    licenca_id = _id_licenca(snap.id, empresa, aplicativo)
+    licenca_snap = db.collection("licencas_apps").document(licenca_id).get()
+    if licenca_snap.exists:
+        dono_atual = str((licenca_snap.to_dict() or {}).get("clienteId") or "")
+        if dono_atual and dono_atual != snap.id:
+            raise HTTPException(409, "Licenca da unidade pertence a outro cliente. Revise o cadastro.")
+    hoje = _v52_agora().date()
+    ate = (hoje + timedelta(days=dados.dias)).isoformat() if acao == "LIBERAR" else "2000-01-01"
+
+    liberacoes = cliente.get("liberacoesManuais") or {}
+    if not isinstance(liberacoes, dict):
+        liberacoes = {}
+    liberacoes = dict(liberacoes)
+    liberacoes[licenca_id] = {
+        "ate": ate,
+        "acao": acao,
+        "motivo": motivo,
+        "uidAdministrador": str(admin["uid"]),
+        "registradoEm": firestore.SERVER_TIMESTAMP,
+    }
+    # Estado da cobranca nao muda. Apenas o acesso efetivo e recalculado.
+    status_financeiro = str(cliente.get("status") or "AGUARDANDO PAGAMENTO").upper()
+    vencimento_financeiro = str(cliente.get("vencimento") or "")
+    acesso = _licenca_efetiva(
+        {**cliente, "liberacoesManuais": liberacoes},
+        licenca_id, status_financeiro, vencimento_financeiro,
+    )
+    comum = {
+        "clienteId": snap.id,
+        "aplicativo": codigo.upper(),
+        "vencimento": acesso["vencimento"],
+        "status": acesso["status"],
+        "statusFinanceiro": status_financeiro,
+        "liberado": acesso["liberado"],
+        "diasTolerancia": acesso["diasTolerancia"],
+        "mensagem": acesso["mensagem"],
+        "origemLiberacao": acesso["origemLiberacao"],
+        "liberacaoManualAte": acesso["liberacaoManualAte"],
+        "linkPagamento": str(cliente.get("linkAssinatura") or ""),
+        "atualizadoEm": firestore.SERVER_TIMESTAMP,
+    }
+
+    registro = db.collection("auditoria_licencas").document()
+    batch = db.batch()
+    batch.set(ref_cliente, {
+        "liberacoesManuais": liberacoes,
+        "atualizadoEm": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+    batch.set(db.collection("licencas").document(licenca_id), {
+        **comum,
+        "clienteNome": empresa,
+        "aplicativoNome": aplicativo,
+        "plano": str(cliente.get("plano") or ""),
+        "valor": cliente.get("valor", 0),
+    }, merge=True)
+    batch.set(db.collection("licencas_apps").document(licenca_id), {
+        **comum,
+        "plano": str(cliente.get("plano") or ""),
+        "valorMensal": cliente.get("valor", 0),
+    }, merge=True)
+    batch.set(registro, {
+        "clienteId": snap.id,
+        "licencaId": licenca_id,
+        "acao": acao,
+        "motivo": motivo,
+        "uidAdministrador": str(admin["uid"]),
+        "dataLimite": ate if acao == "LIBERAR" else "",
+        "statusFinanceiro": status_financeiro,
+        "registradoEm": firestore.SERVER_TIMESTAMP,
+    })
+    batch.commit()
+    return {
+        "ok": True,
+        "licenca_id": licenca_id,
+        "liberado": acesso["liberado"],
+        "ate": acesso["liberacaoManualAte"],
+        "status_financeiro": status_financeiro,
+        "origem": acesso["origemLiberacao"],
+        "auditoria_id": registro.id,
+    }
+
+
 def _v52_operacional():
     if (not MERCADOPAGO_ACCESS_TOKEN
             or not MERCADOPAGO_PRODUCTION_SELLER_ID.isdigit()
@@ -1824,6 +2012,7 @@ async def v52_cron(x_bikego_cron_key: Optional[str] = Header(default=None)):
     db = get_firestore_db()
     hoje = _v52_agora().date()
     bloqueados = 0
+    liberacoes_expiradas = 0
     conciliadas = 0
     erros_conciliacao = 0
     # Recuperacao automatica caso uma notificacao Webhook nao chegue.
@@ -1845,13 +2034,28 @@ async def v52_cron(x_bikego_cron_key: Optional[str] = Header(default=None)):
     docs = list(db.collection("clientes").where("provedorPagamento", "==", "MERCADO_PAGO_AVULSO").limit(100).stream())
     for cli in docs:
         dados = cli.to_dict() or {}
+        referencia = str(dados.get("referenciaAssinatura") or "")
+        manuais = dados.get("liberacoesManuais") or {}
+        if isinstance(manuais, dict) and referencia:
+            for grant in manuais.values():
+                if not isinstance(grant, dict):
+                    continue
+                try:
+                    expirou = date.fromisoformat(str(grant.get("ate") or "")) < hoje
+                except ValueError:
+                    expirou = False
+                if expirou:
+                    # O espelho volta ao estado financeiro; o historico permanece.
+                    _sincronizar_cliente_firebase(referencia)
+                    liberacoes_expiradas += 1
+                    break
         venc = _v52_data(dados.get("vencimento"))
         if (venc and hoje > venc + timedelta(days=2)
                 and str(dados.get("status") or "").upper() == "ATIVO"):
-            ref = str(dados.get("referenciaAssinatura") or "")
-            _sincronizar_cliente_firebase(ref, novo_status="BLOQUEADO")
+            _sincronizar_cliente_firebase(referencia, novo_status="BLOQUEADO")
             bloqueados += 1
     return {"ok": True, "clientesVerificados": len(docs), "bloqueados": bloqueados,
+            "liberacoesExpiradas": liberacoes_expiradas,
             "faturasConciliadas": conciliadas, "errosConciliacao": erros_conciliacao,
             "aviso": "Agende esta rota diariamente no Render; sem agendamento nao ha conciliacao e bloqueio periodicos."}
 
